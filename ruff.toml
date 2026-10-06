@@ -1,0 +1,36 @@
+# Ruff — linter + formatter (single tool, per AGENTS.md Phase 1).
+# Baseline: fix-on-next-run rules only; aggressive rewrites stay opt-in.
+
+target-version = "py312"
+line-length = 120
+exclude = [
+    ".venv",
+    "scripts/health_agent",  # standalone probe scripts, not part of the app
+]
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",    # line length — formatter's job
+    "B008",    # FastAPI Depends() in defaults is idiomatic
+    "SIM105",  # contextlib.suppress less readable than try/except here
+    "SIM117",  # nested with common in async DB code
+    "SIM108",  # ternaries over multi-line expressions hurt readability
+    # TODO(phase-2): add `raise ... from exc` across services/routes (55 sites).
+    "B904",
+]
+
+[lint.isort]
+known-first-party = ["app"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
