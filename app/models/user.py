@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, Enum, ForeignKey, String
+from sqlalchemy import Boolean, Column, DateTime, Enum, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -15,6 +15,9 @@ class User(Base):
     full_name = Column(String(256), nullable=False)
     role = Column(Enum(UserRole), nullable=False)
     is_active = Column(Boolean, default=True)
+    # Bumped to revoke all sessions (logout-all, deactivate). Tokens carry
+    # their version in the "v" claim; missing/NULL means 0.
+    token_version = Column(Integer, default=0)
     created_at = Column(DateTime, default=_now)
 
     company = relationship("Company", back_populates="users")

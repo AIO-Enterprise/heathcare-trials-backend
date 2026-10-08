@@ -24,7 +24,7 @@ import uuid as uuid_mod
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,8 +40,8 @@ from app.schemas.schemas import (
     PresignResponse,
     StartUploadRequest,
 )
-from app.services.storage import file_storage
-from app.services.storage.extractor import BACKEND_ROOT, extract_text, url_to_disk_path
+from app.services.storage import file_storage, get_s3_client
+from app.services.storage.extractor import extract_bytes
 
 router = APIRouter(prefix="/advertisements", tags=["Advertisement Documents"])
 logger = logging.getLogger(__name__)
@@ -95,22 +95,6 @@ def _resolve_content_type(content_type: str, filename: str) -> str:
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         return _EXT_MAP.get(ext, content_type)
     return content_type
-
-
-def _s3_client():
-    import boto3
-    from botocore.config import Config as _BotocoreConfig
-
-    from app.core.config import settings as _s
-
-    kwargs: dict = {
-        "region_name": _s.AWS_REGION,
-        "config": _BotocoreConfig(signature_version="s3v4"),
-    }
-    if _s.AWS_ACCESS_KEY_ID:
-        kwargs["aws_access_key_id"] = _s.AWS_ACCESS_KEY_ID
-        kwargs["aws_secret_access_key"] = _s.AWS_SECRET_ACCESS_KEY
-    return boto3.client("s3", **kwargs)
 
 
 async def _fetch_ad_or_404(db: AsyncSession, ad_id: str, company_id: str) -> Advertisement:
@@ -173,14 +157,13 @@ async def upload_protocol_document(
             detail="Invalid file type. Accepted: PDF, DOCX, DOC, TXT, MD.",
         )
 
-    file_path = await file_storage.save(
+    file_path = file_storage.save(
         file=file,
         subfolder=f"docs/{user.company_id}/{ad_id}",
         filename=file.filename,
     )
 
-    disk_path = url_to_disk_path(file_path, BACKEND_ROOT)
-    content = extract_text(disk_path)
+    content = extract_bytes(file_storage.open_bytes(file_path), file_path)
 
     doc = AdvertisementDocument(
         company_id=user.company_id,
@@ -282,14 +265,13 @@ async def finalize_document_upload(
     file_bytes = b"".join(parts)
     _delete_session(req.upload_id)
 
-    file_path = await file_storage.save_bytes(
+    file_path = file_storage.save_bytes(
         data=file_bytes,
         subfolder=f"docs/{user.company_id}/{ad_id}",
         filename=session["filename"],
     )
 
-    disk_path = url_to_disk_path(file_path, BACKEND_ROOT)
-    content = extract_text(disk_path)
+    content = extract_bytes(file_storage.open_bytes(file_path), file_path)
 
     doc = AdvertisementDocument(
         company_id=user.company_id,
@@ -316,11 +298,11 @@ async def get_document_presign_url(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Return a pre-signed S3 PUT URL so the browser can upload directly to S3,
-    bypassing CloudFront WAF body-size restrictions.
+    Return a pre-signed PUT URL so the browser can upload directly to the
+    active storage backend, bypassing CloudFront WAF body-size restrictions.
 
-    If S3 is not configured (S3_UPLOAD_BUCKET unset) returns {"method": "direct"}
-    and the frontend falls back to the regular multipart endpoint.
+    If the backend has no presigning (local) and no staging bucket, returns
+    {"method": "direct"} and the frontend falls back to multipart.
     """
     from app.core.config import settings as _s
 
@@ -337,6 +319,18 @@ async def get_document_presign_url(
             detail="Invalid file type. Accepted: PDF, DOCX, DOC, TXT, MD.",
         )
 
+    try:
+        presigned = file_storage.presign_upload(
+            subfolder=f"docs/{user.company_id}/{ad_id}", filename=req.filename, content_type=effective_ct
+        )
+    except Exception as e:
+        logger.error("Failed to generate pre-signed URL: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not generate upload URL")
+    if presigned:
+        return PresignResponse(
+            method="presigned", upload_url=presigned.upload_url, s3_key=presigned.key, content_type=effective_ct
+        )
+
     if not _s.S3_UPLOAD_BUCKET:
         return PresignResponse(method="direct")
 
@@ -344,7 +338,7 @@ async def get_document_presign_url(
 
     s3_key = f"{_s.S3_UPLOAD_PREFIX}/{user.company_id}/{ad_id}/{uuid_mod.uuid4()}_{sanitize_filename(req.filename)}"
     try:
-        client = _s3_client()
+        client = get_s3_client()
         upload_url = await asyncio.to_thread(
             client.generate_presigned_url,
             "put_object",
@@ -359,7 +353,7 @@ async def get_document_presign_url(
         logger.error("Failed to generate S3 pre-signed URL: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="Could not generate upload URL")
 
-    return PresignResponse(method="s3", upload_url=upload_url, s3_key=s3_key, content_type=effective_ct)
+    return PresignResponse(method="presigned", upload_url=upload_url, s3_key=s3_key, content_type=effective_ct)
 
 
 @router.post("/{ad_id}/documents/confirm", response_model=AdvertisementDocumentOut)
@@ -370,37 +364,47 @@ async def confirm_s3_document_upload(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Called after the browser has PUT the file to S3.
-    Downloads the file from S3, extracts text, saves to EFS, creates DB record.
-    Deletes the temporary S3 object when done.
+    Called after the browser has PUT the file.
+    Final-location keys ("/uploads/...", from backend presigning) skip the
+    copy: bytes are already in place. Legacy staging keys download from S3,
+    save via the backend, then delete the staging object.
     """
     from app.core.config import settings as _s
 
-    if not _s.S3_UPLOAD_BUCKET:
-        raise HTTPException(status_code=400, detail="S3 upload not configured on this server")
-
     await _fetch_ad_or_404(db, ad_id, user.company_id)
 
-    expected_prefix = f"{_s.S3_UPLOAD_PREFIX}/{user.company_id}/{ad_id}/"
-    if not req.s3_key.startswith(expected_prefix):
-        raise HTTPException(status_code=400, detail="Invalid upload key")
+    if req.s3_key.startswith("/uploads/"):
+        if f"docs/{user.company_id}/{ad_id}" not in req.s3_key:
+            raise HTTPException(status_code=400, detail="Invalid upload key")
+        file_path = req.s3_key
+    else:
+        if not _s.S3_UPLOAD_BUCKET:
+            raise HTTPException(status_code=400, detail="S3 upload not configured on this server")
 
-    try:
-        client = _s3_client()
-        s3_obj = await asyncio.to_thread(client.get_object, Bucket=_s.S3_UPLOAD_BUCKET, Key=req.s3_key)
-        file_bytes = await asyncio.to_thread(lambda: s3_obj["Body"].read())
-    except Exception as e:
-        logger.error("Failed to download from S3 key %s: %s", req.s3_key, e, exc_info=True)
-        raise HTTPException(status_code=500, detail="Could not retrieve uploaded file")
+        expected_prefix = f"{_s.S3_UPLOAD_PREFIX}/{user.company_id}/{ad_id}/"
+        if not req.s3_key.startswith(expected_prefix):
+            raise HTTPException(status_code=400, detail="Invalid upload key")
 
-    file_path = await file_storage.save_bytes(
-        data=file_bytes,
-        subfolder=f"docs/{user.company_id}/{ad_id}",
-        filename=req.filename,
-    )
+        try:
+            client = get_s3_client()
+            s3_obj = await asyncio.to_thread(client.get_object, Bucket=_s.S3_UPLOAD_BUCKET, Key=req.s3_key)
+            file_bytes = await asyncio.to_thread(lambda: s3_obj["Body"].read())
+        except Exception as e:
+            logger.error("Failed to download from S3 key %s: %s", req.s3_key, e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Could not retrieve uploaded file")
 
-    disk_path = url_to_disk_path(file_path, BACKEND_ROOT)
-    content = extract_text(disk_path)
+        file_path = file_storage.save_bytes(
+            data=file_bytes,
+            subfolder=f"docs/{user.company_id}/{ad_id}",
+            filename=req.filename,
+        )
+
+        try:
+            await asyncio.to_thread(client.delete_object, Bucket=_s.S3_UPLOAD_BUCKET, Key=req.s3_key)
+        except Exception:
+            logger.warning("Could not delete staging S3 object %s", req.s3_key)
+
+    content = extract_bytes(file_storage.open_bytes(file_path), file_path)
 
     doc = AdvertisementDocument(
         company_id=user.company_id,
@@ -413,11 +417,6 @@ async def confirm_s3_document_upload(
     )
     db.add(doc)
     await db.flush()
-
-    try:
-        await asyncio.to_thread(client.delete_object, Bucket=_s.S3_UPLOAD_BUCKET, Key=req.s3_key)
-    except Exception:
-        logger.warning("Could not delete staging S3 object %s", req.s3_key)
 
     return doc
 
@@ -463,11 +462,14 @@ async def serve_protocol_document_file(
     if not doc.file_path:
         raise HTTPException(status_code=404, detail="No file attached to this document")
 
-    relative = doc.file_path.lstrip("/").removeprefix("uploads/")
-    disk_path = os.path.normpath(os.path.join(BACKEND_ROOT, "uploads", relative))
-
-    if not os.path.exists(disk_path):
+    data = file_storage.open_bytes(doc.file_path)
+    if data is None:
         raise HTTPException(status_code=404, detail="File not found on disk")
 
-    media_type, _ = mimetypes.guess_type(disk_path)
-    return FileResponse(path=disk_path, media_type=media_type or "application/octet-stream")
+    filename = doc.file_path.rstrip("/").split("/")[-1]
+    media_type, _ = mimetypes.guess_type(filename)
+    return Response(
+        content=data,
+        media_type=media_type or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )

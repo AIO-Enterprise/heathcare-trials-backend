@@ -3,7 +3,11 @@ Advertisement routes — split across domain modules.
 This file is kept for backwards-compatible imports only.
 """
 
+import logging
+
 from app.api.routes.campaigns.ads_analysis import router as _analysis_router
+
+logger = logging.getLogger(__name__)
 from app.api.routes.campaigns.ads_crud import router as _crud_router
 from app.api.routes.campaigns.ads_documents import router as _docs_router
 from app.api.routes.campaigns.ads_generation import router as _gen_router

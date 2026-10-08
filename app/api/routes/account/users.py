@@ -7,6 +7,8 @@ CRUD operations for users within a company.
 Only Admin can create/manage users.
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +17,8 @@ from app.core.security import hash_password, require_roles
 from app.db.database import get_db
 from app.models.models import User, UserRole
 from app.schemas.schemas import UserCreate, UserOut, UserUpdateSelf
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["User Management"])
 
@@ -53,6 +57,7 @@ async def upgrade_self_to_super(
     in-tenant elevation, not a cross-company escalation. (Super User callers pass
     this gate too via the require_roles bypass; for them it is a harmless no-op.)
     """
+    logger.info("User=%s self-upgraded to SUPER_USER", current_user.id)
     current_user.role = UserRole.SUPER_USER
     await db.flush()
     return current_user
@@ -84,6 +89,7 @@ async def create_user(
     )
     db.add(user)
     await db.flush()
+    logger.info("Created user=%s role=%s company=%s", user.id, user.role.value, user.company_id)
     return user
 
 
@@ -143,7 +149,10 @@ async def deactivate_user(
                 detail="Cannot deactivate the last active Study Coordinator.",
             )
 
+    logger.info("Deactivating user=%s by admin=%s", user_id, admin.id)
     user.is_active = False
+    # Revoke any outstanding sessions immediately.
+    user.token_version = (user.token_version or 0) + 1
     # Scramble the email so the address can be re-registered in future.
     user.email = f"deactivated_{user.id}@deactivated.invalid"
     return user

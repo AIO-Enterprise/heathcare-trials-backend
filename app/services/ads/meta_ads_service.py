@@ -21,7 +21,7 @@ from pathlib import Path
 import requests
 
 from app.core.exceptions import ExternalServiceError, ValidationError
-from app.core.media import media_to_disk
+from app.services.storage import file_storage
 
 logger = logging.getLogger(__name__)
 
@@ -219,13 +219,9 @@ class MetaAdsService:
 
     # ─── Step 1: Upload image ──────────────────────────────────────────────────
 
-    async def upload_image(self, disk_path: str) -> str:
-        """Upload an image by base64 and return its image_hash."""
-        path = Path(disk_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Ad image not found on disk: {disk_path}")
-
-        image_b64 = base64.b64encode(path.read_bytes()).decode()
+    async def upload_image(self, image_bytes: bytes) -> str:
+        """Upload image bytes by base64 and return its image_hash."""
+        image_b64 = base64.b64encode(image_bytes).decode()
         result = await self._post(
             f"{self.ad_account_id}/adimages",
             {"bytes": image_b64},
@@ -239,23 +235,18 @@ class MetaAdsService:
 
     # ─── Step 1 (video): Upload video ─────────────────────────────────────────
 
-    async def upload_video(self, disk_path: str) -> str:
+    async def upload_video(self, video_bytes: bytes, filename: str = "creative.mp4") -> str:
         """
-        Upload an mp4 file to Meta advideos via multipart and return the video_id.
+        Upload mp4 bytes to Meta advideos via multipart and return the video_id.
         Polls until the video finishes processing before returning.
         """
-        path = Path(disk_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Ad video not found on disk: {disk_path}")
-
         url = self._url(f"{self.ad_account_id}/advideos")
-        video_bytes = path.read_bytes()
 
         def _sync_upload() -> dict:
             resp = requests.post(
                 url,
-                data={"access_token": self.access_token, "name": path.stem},
-                files={"source": (path.name, video_bytes, "video/mp4")},
+                data={"access_token": self.access_token, "name": Path(filename).stem},
+                files={"source": (Path(filename).name, video_bytes, "video/mp4")},
                 timeout=180,
             )
             return resp.json()
@@ -624,7 +615,6 @@ class MetaAdsService:
         daily_budget_usd: float,
         destination_url: str,
         targeting_countries: list[str],
-        backend_root: str,
         display_url: str | None = None,
         addon_type: str | None = None,
         addon_phone: str | None = None,
@@ -702,17 +692,20 @@ class MetaAdsService:
 
         ad_ids = []
         for idx, creative in enumerate(to_publish):
-            # Resolve image_url (/outputs/…) → absolute disk path
+            # Resolve image_url (/outputs/…) → bytes via the storage backend
             image_url: str = creative.get("image_url", "")
-            disk_path = str(Path(backend_root) / media_to_disk(image_url))
+            png_bytes = file_storage.open_bytes(image_url)
+            if png_bytes is None:
+                logger.warning("Creative bytes missing for %s — skipping", image_url)
+                continue
             is_video = image_url.lower().endswith(".mp4")
 
             cta_text = (creative.get("cta") or "Book Now").upper().strip()
             cta_type = CTA_MAP.get(cta_text, "BOOK_NOW")
 
             if is_video:
-                logger.info("STEP 3: Uploading video %s...", disk_path)
-                video_id = await self.upload_video(disk_path)
+                logger.info("STEP 3: Uploading video %s...", image_url)
+                video_id = await self.upload_video(png_bytes, image_url.rstrip("/").split("/")[-1])
                 logger.info("STEP 3 OK: video_id %s", video_id)
 
                 logger.info("STEP 4: Creating video creative %d...", idx + 1)
@@ -729,8 +722,8 @@ class MetaAdsService:
                     addon_phone=addon_phone,
                 )
             else:
-                logger.info("STEP 3: Uploading image %s...", disk_path)
-                image_hash = await self.upload_image(disk_path)
+                logger.info("STEP 3: Uploading image %s...", image_url)
+                image_hash = await self.upload_image(png_bytes)
                 logger.info("STEP 3 OK: image_hash %s", image_hash)
 
                 logger.info("STEP 4: Creating creative %d...", idx + 1)

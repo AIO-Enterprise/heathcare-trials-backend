@@ -20,7 +20,7 @@ from openai import AzureOpenAI, OpenAI
 
 from app.core.config import settings
 from app.core.llm import extract_json, get_ai_client
-from app.core.media import media_to_disk, media_url
+from app.services.storage import file_storage
 from app.models.models import Advertisement
 
 logger = logging.getLogger(__name__)
@@ -231,9 +231,6 @@ class CreativeService:
         Main entry point.
         Returns list of creative dicts: {format, headline, body, cta, layout, image_prompt, image_url}
         """
-        output_dir = os.path.join(settings.OUTPUT_DIR, self.company_id, ad.id)
-        os.makedirs(output_dir, exist_ok=True)
-
         # Step 1: Claude → structured JSON (layout + photo prompt)
         brief = await self._generate_brief(ad)
         items = brief.get("creatives", [])
@@ -254,7 +251,6 @@ class CreativeService:
                     layout_for_compositor,
                     item.get("format", "square"),
                     item.get("index", 0),
-                    output_dir,
                     ad.id,
                 )
             return {
@@ -276,7 +272,6 @@ class CreativeService:
                 video_url = await asyncio.to_thread(
                     self._generate_video_from_creative,
                     first,
-                    output_dir,
                     ad.id,
                 )
                 if video_url:
@@ -336,7 +331,6 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
         layout: dict,
         format_name: str,
         index: int,
-        output_dir: str,
         ad_id: str,
     ) -> str | None:
         """
@@ -396,10 +390,7 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
             safe_fmt = format_name.replace(" ", "_").replace("/", "-").replace(":", "-").lower()
             ts = int(time.time())
             filename = f"creative_{index}_{safe_fmt}_{ts}.png"
-            file_path = os.path.join(output_dir, filename)
-            with open(file_path, "wb") as f:
-                f.write(final_png)
-            return media_url(f"/outputs/{self.company_id}/{ad_id}/{filename}")
+            return file_storage.save_bytes(final_png, f"outputs/{self.company_id}/{ad_id}", filename)
         except Exception as exc:
             log.error("Failed to save creative [format=%s, ad=%s]: %s", format_name, ad_id, exc)
             return None
@@ -414,13 +405,10 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
         if not png_sources:
             return []
 
-        output_dir = os.path.join(settings.OUTPUT_DIR, self.company_id, ad.id)
-        os.makedirs(output_dir, exist_ok=True)
-
         results = list(
             await asyncio.gather(
                 *[
-                    asyncio.to_thread(self._generate_short_from_creative, c, output_dir, ad.id, i)
+                    asyncio.to_thread(self._generate_short_from_creative, c, ad.id, i)
                     for i, c in enumerate(png_sources)
                 ]
             )
@@ -431,25 +419,19 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
     def _generate_short_from_creative(
         self,
         creative: dict,
-        output_dir: str,
         ad_id: str,
         index: int = 0,
     ) -> dict | None:
         import logging as _log
-        import os as _os
         import time
 
         log = _log.getLogger(__name__)
 
         image_url = creative.get("image_url", "")
-        relative = media_to_disk(image_url)
-        png_path = _os.path.join(settings.OUTPUT_DIR, relative)
-        if not _os.path.exists(png_path):
-            log.warning("PNG not found for short generation: %s", png_path)
+        png_bytes = file_storage.open_bytes(image_url)
+        if not png_bytes:
+            log.warning("PNG not found for short generation: %s", image_url)
             return None
-
-        with open(png_path, "rb") as f:
-            png_bytes = f.read()
 
         fmt = creative.get("format", "1080x1920")
         canvas_w, canvas_h = self._get_canvas_dimensions(fmt)
@@ -467,13 +449,11 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
         try:
             ts = int(time.time())
             filename = f"short_{index}_{ts}.mp4"
-            out_path = _os.path.join(output_dir, filename)
-            with open(out_path, "wb") as f:
-                f.write(mp4_bytes)
+            stored_url = file_storage.save_bytes(mp4_bytes, f"outputs/{self.company_id}/{ad_id}", filename)
             return {
                 **creative,
                 "format": f"{fmt} · Short",
-                "image_url": media_url(f"/outputs/{self.company_id}/{ad_id}/{filename}"),
+                "image_url": stored_url,
             }
         except Exception as exc:
             log.error("Failed to save short for ad %s: %s", ad_id, exc)
@@ -482,11 +462,9 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
     def _generate_video_from_creative(
         self,
         creative: dict,
-        output_dir: str,
         ad_id: str,
     ) -> str | None:
         import logging
-        import os as _os
         import time
 
         log = logging.getLogger(__name__)
@@ -495,15 +473,10 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
         if not image_url:
             return None
 
-        # Map /outputs/{company_id}/{ad_id}/file.png → disk path
-        relative = media_to_disk(image_url)
-        png_path = _os.path.join(settings.OUTPUT_DIR, relative)
-        if not _os.path.exists(png_path):
-            log.warning("PNG not found for video generation: %s", png_path)
+        png_bytes = file_storage.open_bytes(image_url)
+        if not png_bytes:
+            log.warning("PNG not found for video generation: %s", image_url)
             return None
-
-        with open(png_path, "rb") as f:
-            png_bytes = f.read()
 
         fmt = creative.get("format", "1080x1920")
         canvas_w, canvas_h = self._get_canvas_dimensions(fmt)
@@ -521,10 +494,7 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
         try:
             ts = int(time.time())
             filename = f"creative_video_{ts}.mp4"
-            out_path = _os.path.join(output_dir, filename)
-            with open(out_path, "wb") as f:
-                f.write(mp4_bytes)
-            return media_url(f"/outputs/{self.company_id}/{ad_id}/{filename}")
+            return file_storage.save_bytes(mp4_bytes, f"outputs/{self.company_id}/{ad_id}", filename)
         except Exception as exc:
             log.error("Failed to save video creative for ad %s: %s", ad_id, exc)
             return None

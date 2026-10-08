@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.media import media_url
 from app.schemas.enums import AdStatusEnum, AdTypeEnum
@@ -45,6 +45,7 @@ class AdvertisementOut(BaseModel):
     ad_details: dict[str, Any] | None = None
     output_url: str | None = None
     hosted_url: str | None = None
+    website_download_url: str | None = None
     output_files: list[dict[str, Any]] | None = None
     shorts_files: list[dict[str, Any]] | None = None
     generation_error: str | None = None
@@ -79,6 +80,13 @@ class AdvertisementOut(BaseModel):
             if img and not img.startswith("http"):
                 creative["image_url"] = media_url(img)
         return v
+
+    @model_validator(mode="after")
+    def _download_url(self):
+        # ponytail: derived, not stored — serves ?download=true off the same public endpoint
+        if self.output_url and not self.website_download_url:
+            self.website_download_url = media_url(f"/api/advertisements/{self.id}/website") + "?download=true"
+        return self
 
 
 class AdvertisementUpdate(BaseModel):

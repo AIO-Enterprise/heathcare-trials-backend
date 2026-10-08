@@ -12,7 +12,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.api.routes.account import auth, company, users
 from app.api.routes.assets import brand_kit, documents, onboarding
@@ -25,8 +24,10 @@ from app.api.routes.publishing.ads_google import router as google_router
 from app.api.routes.publishing.ads_google_manage import router as google_manage_router
 from app.core.config import settings
 from app.core.exceptions import AppError
+from app.core.logging import set_request_id, setup_logging
 from app.core.ratelimit import rate_limit_middleware
 from app.db.database import init_db
+from app.services.storage import storage_is_local
 from app.services.ads.scheduling.google_scheduler import run_google_pause_scheduler
 from app.services.ads.scheduling.meta_scheduler import run_pause_scheduler
 from app.services.messaging.workers.sms_worker import (
@@ -38,17 +39,30 @@ from app.services.messaging.workers.sms_worker import (
 from app.services.voice.campaign_worker import resume_running_campaigns, run_stale_sweeper
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-# App logs stay at INFO in all environments — publish checkpoints, scheduler
-# actions and other audit-relevant lines must survive in prod. Only per-request
-# access noise (uvicorn.access) is silenced outside DEBUG.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
-)
-if not settings.DEBUG:
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+# Central setup in app.core.logging: INFO in dev, WARNING in prod.
+# Publish checkpoints, scheduler actions and other audit-relevant lines must
+# survive in prod — emit those at WARNING+ or they vanish when APP_ENV=prod.
+setup_logging()
 
 logger = logging.getLogger(__name__)
+
+
+def _allowed_origins() -> list[str]:
+    return [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+
+
+async def _csrf_origin_check(request: Request, call_next):
+    # ponytail: SameSite=Lax does the heavy lifting; this only closes forged-Origin gaps, no token store
+    if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.cookies.get("access_token"):
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if origin:
+            from urllib.parse import urlparse
+
+            host = urlparse(origin).netloc
+            allowed = {urlparse(o).netloc or o for o in _allowed_origins()}
+            if host and host not in allowed:
+                return JSONResponse(status_code=403, content={"detail": "Origin not allowed"})
+    return await call_next(request)
 
 
 def _validate_secret_key() -> None:
@@ -61,6 +75,12 @@ def _validate_secret_key() -> None:
             "SECRET_KEY is missing, too short (<32 chars), or a known default. "
             'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
         )
+
+
+def _validate_public_urls() -> None:
+    """Refuse to boot production without absolute-URL config — relative media links would 404 cross-origin."""
+    if settings.APP_ENV == "prod" and not (settings.BACKEND_PUBLIC_URL or "").rstrip("/"):
+        raise RuntimeError("BACKEND_PUBLIC_URL is required when APP_ENV=prod (used for absolute media/WS/website URLs)")
 
 
 def _supervised(factory):
@@ -113,12 +133,15 @@ async def _security_headers(request: Request, call_next):
 async def lifespan(app: FastAPI):
     # Startup — validate config, create DB tables, ensure storage directories exist
     _validate_secret_key()
+    _validate_public_urls()
     await init_db()
-    os.makedirs(os.path.join(settings.STATIC_DIR, "logos"), exist_ok=True)
-    os.makedirs(os.path.join(settings.STATIC_DIR, "pages"), exist_ok=True)
-    os.makedirs(os.path.join(settings.UPLOAD_DIR, "logos"), exist_ok=True)
-    os.makedirs(os.path.join(settings.UPLOAD_DIR, "docs"), exist_ok=True)
-    os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
+    if storage_is_local():
+        os.makedirs(os.path.join(settings.STATIC_DIR, "logos"), exist_ok=True)
+        os.makedirs(os.path.join(settings.STATIC_DIR, "pages"), exist_ok=True)
+        os.makedirs(os.path.join(settings.UPLOAD_DIR, "logos"), exist_ok=True)
+        os.makedirs(os.path.join(settings.UPLOAD_DIR, "docs"), exist_ok=True)
+        os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
+    logger.info("STORAGE_BACKEND = %r", settings.STORAGE_BACKEND or "local")
     logger.info("BACKEND_PUBLIC_URL = %r", settings.BACKEND_PUBLIC_URL)
     logger.info("META_OAUTH_REDIRECT_URI = %r", settings.META_OAUTH_REDIRECT_URI)
 
@@ -139,6 +162,9 @@ async def lifespan(app: FastAPI):
             await t
         except asyncio.CancelledError:
             pass
+    from app.core.bedrock import close_clients
+
+    await close_clients()
 
 
 app = FastAPI(
@@ -154,9 +180,14 @@ app = FastAPI(
 
 async def _request_id(request: Request, call_next):
     """Propagate or mint an X-Request-ID for cross-log tracing."""
-    request.state.request_id = request.headers.get("x-request-id", "")[:128] or uuid.uuid4().hex
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request.state.request_id
+    rid = request.headers.get("x-request-id", "")[:128] or uuid.uuid4().hex
+    request.state.request_id = rid
+    set_request_id(rid)
+    try:
+        response = await call_next(request)
+    finally:
+        set_request_id("-")
+    response.headers["X-Request-ID"] = rid
     return response
 
 
@@ -165,6 +196,7 @@ async def _request_id(request: Request, call_next):
 # including 429s from the inner rate limiter, carries the request ID.
 # _security_headers sits in the middle so it also covers rate-limited replies.
 app.middleware("http")(rate_limit_middleware)
+app.middleware("http")(_csrf_origin_check)
 app.middleware("http")(_security_headers)
 app.middleware("http")(_request_id)
 
@@ -188,30 +220,20 @@ async def unhandled_error_handler(request: Request, exc: Exception):
     )
 
 
-# CORS — open to all origins.
-# Real security is enforced by JWT on every request; CORS is browser-level only.
-# allow_credentials must be False when allow_origins=["*"] (Starlette constraint).
-# The frontend uses Authorization: Bearer <token>, not cookies, so credentials
-# mode is never 'include' — False is correct here.
+# CORS — explicit origins from ALLOWED_ORIGINS (cookies require this; "*" + credentials is rejected by browsers).
+# ponytail: mounts below stay until the frontend cutover (doc §10 step 4) — deleting now would 404 current media loads
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=_allowed_origins(),
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Static file serving — logos and brand assets under ./static/
-os.makedirs(settings.STATIC_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory=settings.STATIC_DIR), name="static")
-
-# Upload file serving — documents and logos under ./uploads/
-os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
-
-# Output file serving — generated creatives under ./outputs/
-os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
-app.mount("/outputs", StaticFiles(directory=settings.OUTPUT_DIR), name="outputs")
+# Static/media bytes are served only through auth-checked API routes
+# (/{doc_id}/file, /{ad_id}/documents/{doc_id}/file, /{ad_id}/website)
+# or the explicitly public landing-page endpoint — no open mounts.
+# ponytail: FileResponse streams in-process; ceiling = worker blocking on huge files — X-Sendfile/S3 redirect when measured
 
 # ─── Register Route Modules ──────────────────────────────────────────────────
 

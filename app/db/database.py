@@ -17,7 +17,9 @@ from app.core.config import settings
 _is_postgres = settings.DATABASE_URL.startswith("postgresql")
 
 if _is_postgres:
-    _connect_args = {"ssl": "require"}
+    # An explicit ?ssl= in the URL wins (local Postgres usually has no SSL);
+    # otherwise require SSL (managed/prod databases).
+    _connect_args = {} if "ssl=" in settings.DATABASE_URL else {"ssl": "require"}
     _pool_kwargs = {"pool_size": 10, "max_overflow": 20}
 else:
     # SQLite on EFS: single-writer safe settings.
@@ -84,6 +86,7 @@ _add_column_if_missing = _run_migration
 # changes — migrate it, never strand it).
 
 _APPOINTMENT_TZ_VERSION = "002_appointment_tz_normalization"
+_NULL_CHAT_SESSIONS_VERSION = "001_drop_null_campaign_chat_sessions"
 
 # Appointments booked through SurveyPage before timezone-aware booking stored
 # true UTC instants (the page sent toISOString() and the backend stripped the
@@ -139,6 +142,21 @@ async def _run_data_migrations(conn) -> None:
             "WHERE company_id IS NULL"
         )
     )
+
+    # ── Legacy null-campaign chat sessions (one-shot, DEBUG only) ───────────
+    # These rows predate the campaign_id column. Prod behavior is unchanged
+    # (never deleted); dev boots used to wipe them on every restart.
+    if settings.DEBUG:
+        _done = await conn.execute(
+            text("SELECT version FROM _data_migrations WHERE version = :v"),
+            {"v": _NULL_CHAT_SESSIONS_VERSION},
+        )
+        if _done.first() is None:
+            await conn.execute(text("DELETE FROM chat_sessions WHERE campaign_id IS NULL"))
+            await conn.execute(
+                text("INSERT INTO _data_migrations (version) VALUES (:v)"),
+                {"v": _NULL_CHAT_SESSIONS_VERSION},
+            )
 
     # ── Appointment timezone normalization (one-shot) ──────────────────────────
     already = await conn.execute(
@@ -260,6 +278,8 @@ async def init_db():
                 "ALTER TABLE sms_campaigns ADD COLUMN company_id VARCHAR;",
                 # AI generation failure surfacing
                 "ALTER TABLE advertisements ADD COLUMN generation_error TEXT;",
+                # JWT revocation counter
+                "ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 0;",
             ]
             for stmt in _sqlite_cols:
                 try:
@@ -378,6 +398,9 @@ async def init_db():
         # SMS tenant scoping
         await _add_column_if_missing(conn, "ALTER TABLE sms_messages ADD COLUMN IF NOT EXISTS company_id VARCHAR;")
         await _add_column_if_missing(conn, "ALTER TABLE sms_campaigns ADD COLUMN IF NOT EXISTS company_id VARCHAR;")
+        await _add_column_if_missing(
+            conn, "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER DEFAULT 0;"
+        )
 
         # chat_sessions.campaign_id — added after initial table creation.
         await _run_migration(conn, "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS campaign_id VARCHAR;")
@@ -399,10 +422,8 @@ async def init_db():
             END $$;
         """,
         )
-        # Remove sessions that have no campaign_id (legacy rows before this column existed).
-        # Destructive normalization — only run in DEBUG so a prod boot never wipes data.
-        if settings.DEBUG:
-            await _run_migration(conn, "DELETE FROM chat_sessions WHERE campaign_id IS NULL;")
+        # (Null-campaign session cleanup lives in _run_data_migrations,
+        # marker-guarded so it runs at most once per environment.)
 
         # Recreate platform_connections FKs with ON DELETE CASCADE so that
         # deleting a company or user automatically removes their connections.
@@ -512,15 +533,17 @@ async def init_db():
                 pass
 
         # Normalise role column to enum member NAMES (what SQLAlchemy stores).
+        # Cast to text so legacy string literals that aren't valid enum values
+        # don't raise "invalid input value for enum" on a fresh database.
         await _run_migration(
-            conn, "UPDATE users SET role = 'STUDY_COORDINATOR' WHERE role IN ('ADMIN', 'study_coordinator');"
+            conn, "UPDATE users SET role = 'STUDY_COORDINATOR' WHERE role::text IN ('ADMIN', 'study_coordinator');"
         )
         await _run_migration(
-            conn, "UPDATE users SET role = 'PROJECT_MANAGER'   WHERE role IN ('REVIEWER', 'project_manager');"
+            conn, "UPDATE users SET role = 'PROJECT_MANAGER'   WHERE role::text IN ('REVIEWER', 'project_manager');"
         )
         await _run_migration(
-            conn, "UPDATE users SET role = 'ETHICS_MANAGER'    WHERE role IN ('ETHICS_REVIEWER', 'ethics_manager');"
+            conn, "UPDATE users SET role = 'ETHICS_MANAGER'    WHERE role::text IN ('ETHICS_REVIEWER', 'ethics_manager');"
         )
-        await _run_migration(conn, "UPDATE users SET role = 'PUBLISHER'         WHERE role = 'publisher';")
+        await _run_migration(conn, "UPDATE users SET role = 'PUBLISHER' WHERE role::text = 'publisher';")
 
         await _run_data_migrations(conn)

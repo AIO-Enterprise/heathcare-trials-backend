@@ -6,6 +6,7 @@ Central config loaded from environment variables.
 """
 
 import os
+from typing import Literal
 
 from pydantic_settings import BaseSettings
 
@@ -23,6 +24,7 @@ _ENV_FILE = next((p for p in _ENV_CANDIDATES if os.path.exists(p)), ".env")
 class Settings(BaseSettings):
     # App
     APP_NAME: str = "Marketing Analytics Platform"
+    APP_ENV: Literal["dev", "prod"] = "dev"  # dev → INFO logs, prod → WARNING logs
     DEBUG: bool = False
     SECRET_KEY: str = "CHANGE-ME-in-production-use-openssl-rand-hex-32"
 
@@ -125,6 +127,11 @@ class Settings(BaseSettings):
     # Example: https://marketingai-backend.wonderfulpond-9e50895b.eastus2.azurecontainerapps.io
     BACKEND_PUBLIC_URL: str | None = None
 
+    # Frontend origins allowed to call the API with cookies (comma-separated).
+    # Required for cookie auth — browsers reject allow_credentials with "*".
+    # Example: https://app.example.com,http://localhost:5173
+    ALLOWED_ORIGINS: str = ""
+
     # Email (SMTP) — leave blank to log OTP to console instead of sending
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
@@ -151,6 +158,18 @@ class Settings(BaseSettings):
     OUTPUT_DIR: str = "./outputs"
     STATIC_DIR: str = "./static"
     STATIC_URL: str = "/static"
+
+    # Storage backend for user assets (images, html, videos, docs, logos).
+    # "local" (disk under UPLOAD_DIR/OUTPUT_DIR/STATIC_DIR), "s3" (AWS S3),
+    # or "azure" (Azure Blob Storage). Stored path values ("/uploads/...",
+    # "/outputs/...") are identical for every backend — only bytes move.
+    STORAGE_BACKEND: str = "local"
+    # Bucket (S3) or container (Azure). Falls back to S3_UPLOAD_BUCKET when blank.
+    STORAGE_BUCKET: str = ""
+    # Optional key prefix inside the bucket/container, e.g. "prod".
+    STORAGE_PREFIX: str = ""
+    # Azure Blob — connection string; S3 reuses AWS_REGION + AWS_* keys above.
+    AZURE_STORAGE_CONNECTION_STRING: str = ""
 
     # S3 — optional. When set, protocol document uploads use S3 pre-signed URLs
     # so files bypass CloudFront WAF body-size limits entirely.

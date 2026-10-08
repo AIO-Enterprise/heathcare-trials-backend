@@ -1,7 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
+from app.core.media import media_url
 from app.schemas.enums import DocumentTypeEnum
 
 # ─── Company Documents ────────────────────────────────────────────────────────
@@ -19,12 +20,19 @@ class DocumentOut(BaseModel):
     title: str
     content: str | None = None
     file_path: str | None = None
+    file_url: str | None = None
     priority: int
     version: int
     updated_at: datetime
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _absolutize_file_url(self):
+        if self.file_path and not self.file_url:
+            self.file_url = media_url(self.file_path)
+        return self
 
 
 class DocumentUpdate(BaseModel):
@@ -42,11 +50,18 @@ class AdvertisementDocumentOut(BaseModel):
     doc_type: str
     title: str
     file_path: str | None = None
+    file_url: str | None = None
     priority: int
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _absolutize_file_url(self):
+        if self.file_path and not self.file_url:
+            self.file_url = media_url(self.file_path)
+        return self
 
 
 # ─── Chunked Upload ───────────────────────────────────────────────────────────
@@ -82,7 +97,7 @@ class PresignRequest(BaseModel):
 
 
 class PresignResponse(BaseModel):
-    method: str  # "s3" | "direct"
+    method: str  # "presigned" | "direct"
     upload_url: str | None = None
     s3_key: str | None = None
     content_type: str | None = None

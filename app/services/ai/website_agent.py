@@ -15,11 +15,13 @@ Page order: nav → hero → survey → [interaction hidden] → features → ct
 import json
 import logging
 import os
+from html import escape as _html_escape
 
 from app.core.config import settings
 from app.core.llm import get_ai_client
 from app.core.media import media_url
 from app.models.models import Advertisement, BrandKit, Company
+from app.services.storage import file_storage
 
 logger = logging.getLogger(__name__)
 
@@ -121,9 +123,6 @@ class WebsiteAgentService:
         brand_kit: BrandKit | None,
         company: Company | None,
     ) -> str:
-        output_dir = os.path.join(settings.OUTPUT_DIR, self.company_id, ad.id, "website")
-        os.makedirs(output_dir, exist_ok=True)
-
         ad_types = [t.lower() for t in (ad.ad_type or [])]
         bot_config = ad.bot_config or {}
         bot_name = bot_config.get("name", "Assistant") if isinstance(bot_config, dict) else "Assistant"
@@ -151,14 +150,13 @@ class WebsiteAgentService:
             booking_window_end=str(win_end),
         )
 
-        index_path = os.path.join(output_dir, "index.html")
         # Drop lone surrogate code points that Claude occasionally emits —
         # they are invalid in UTF-8 and would raise UnicodeEncodeError on write.
         html = html.encode("utf-8", errors="ignore").decode("utf-8")
-        with open(index_path, "w", encoding="utf-8") as f:
-            f.write(html)
 
-        return media_url(f"/outputs/{self.company_id}/{ad.id}/website/index.html")
+        return file_storage.save_bytes(
+            html.encode("utf-8"), f"outputs/{self.company_id}/{ad.id}/website", "index.html"
+        )
 
     # ── CSS template (brand colors injected, never written by Claude) ─────────
 
@@ -384,6 +382,12 @@ class WebsiteAgentService:
         booking_window_start: str = "",
         booking_window_end: str = "",
     ) -> str:
+        # HTML-text context escaping for tenant-supplied strings (title, bot
+        # name/welcome). The AI-generated body is markup by design and must
+        # NOT be escaped; booking windows are server-generated dates.
+        title = _html_escape(title or "", quote=True)
+        bot_name = _html_escape(bot_name or "Assistant", quote=True)
+        bot_welcome = _html_escape(bot_welcome or "", quote=False)
         has_chat = "chatbot" in ad_types
         has_voice = "voicebot" in ad_types
         has_interact = has_chat or has_voice
@@ -576,7 +580,7 @@ class WebsiteAgentService:
   if (!panel || !toggle) return;
 
   var CAMPAIGN_ID  = '{ad_id}';
-  var API_BASE     = window.location.origin;
+  var API_BASE     = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
   var STORAGE_KEY  = 'chat_session_' + CAMPAIGN_ID;
   var sending      = false;
 
@@ -718,7 +722,7 @@ class WebsiteAgentService:
 <script>
 (function () {{
   var AD_ID    = '{ad_id}';
-  var API_BASE = window.location.origin;
+  var API_BASE = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
 
   var nameEl   = document.getElementById('reg-name');
   var ageEl    = document.getElementById('reg-age');
@@ -856,7 +860,7 @@ class WebsiteAgentService:
 <script>
 (function () {{
   var AD_ID  = '{ad_id}';
-  var API    = window.location.origin;
+  var API    = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
   var dateEl = document.getElementById('appt-date');
   var slots  = document.getElementById('appt-slots');
   var tzEl   = document.getElementById('appt-tz');
@@ -1090,7 +1094,7 @@ class WebsiteAgentService:
 (function () {{
 
   var AD_ID    = '{ad_id}';
-  var API_BASE = window.location.origin;
+  var API_BASE = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
 
   /* ── Country list ──────────────────────────────────────────────────────── */
   var CTRY = [
@@ -1494,7 +1498,7 @@ class WebsiteAgentService:
 (function () {{
 
   var AD_ID    = '{ad_id}';
-  var API_BASE = window.location.origin;
+  var API_BASE = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
 
   /* ── Utility: find a button by ID or by text fallback ─────────────────── */
   function findBtn(id, hints) {{
@@ -1688,7 +1692,7 @@ class WebsiteAgentService:
         company: Company | None,
     ) -> str:
         company_name = company.name if company else "Our Company"
-        logo_url = company.logo_url if company else None
+        logo_url = media_url(company.logo_url) if company and company.logo_url else None
         industry = company.industry if company else ""
         adjectives = (brand_kit.adjectives if brand_kit else None) or "professional, trustworthy"
         dos = (brand_kit.dos if brand_kit else None) or ""
@@ -1824,7 +1828,7 @@ Start output with <nav>. End with </footer>. No inline styles. No custom classes
         from html import escape as _esc
 
         company_name = _esc(company.name if company else "Our Company", quote=True)
-        logo_url = _esc(company.logo_url, quote=True) if (company and company.logo_url) else None
+        logo_url = _esc(media_url(company.logo_url), quote=True) if (company and company.logo_url) else None
         title = _esc(ad.title, quote=True)
         ad_types = [t.lower() for t in (ad.ad_type or [])]
         bot_config = ad.bot_config or {}

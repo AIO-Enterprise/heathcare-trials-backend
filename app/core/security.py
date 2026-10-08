@@ -49,15 +49,23 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 # ─── JWT ──────────────────────────────────────────────────────────────────────
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
-def create_access_token(user_id: str, role: str, company_id: str) -> str:
+def _bearer_from(request: Request, credentials: HTTPAuthorizationCredentials | None) -> str | None:
+    if credentials and credentials.credentials:
+        return credentials.credentials
+    auth = request.headers.get("authorization", "")
+    return auth.removeprefix("Bearer ").strip() or None  # ponytail: manual fallback, drop when header fallback is deleted
+
+
+def create_access_token(user_id: str, role: str, company_id: str, token_version: int = 0) -> str:
     expire = datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
     payload = {
         "sub": user_id,
         "role": role,
         "company_id": company_id,
+        "v": token_version or 0,
         "exp": expire,
     }
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
@@ -76,10 +84,13 @@ def decode_token(token: str) -> dict:
 
 async def get_current_user(
     request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    payload = decode_token(credentials.credentials)
+    token = request.cookies.get("access_token") or _bearer_from(request, credentials)
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = decode_token(token)
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
@@ -88,6 +99,11 @@ async def get_current_user(
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+
+    # Token revocation — logout-all / deactivate bumps token_version.
+    # Missing/NULL counts as 0 so pre-revocation tokens and rows keep working.
+    if (payload.get("v") or 0) != (user.token_version or 0):
+        raise HTTPException(status_code=401, detail="Session revoked — please sign in again")
 
     # Block access to all non-onboarding routes until the company finishes setup.
     path = request.url.path

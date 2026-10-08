@@ -36,26 +36,50 @@ def _bedrock_kwargs() -> dict:
     return kwargs
 
 
+# Module-level singletons — one connection pool per process instead of a
+# fresh pool on every AI call.
+_sync_client = None
+_async_client = None
+
+
 def get_client():
     """Synchronous client — use in blocking/trainer contexts."""
-    if settings.USE_BEDROCK:
-        from anthropic import AnthropicBedrock
+    global _sync_client
+    if _sync_client is None:
+        if settings.USE_BEDROCK:
+            from anthropic import AnthropicBedrock
 
-        return AnthropicBedrock(**_bedrock_kwargs())
-    from anthropic import Anthropic
+            _sync_client = AnthropicBedrock(**_bedrock_kwargs())
+        else:
+            from anthropic import Anthropic
 
-    return Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            _sync_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    return _sync_client
 
 
 def get_async_client():
     """Async client — use in async service methods."""
-    if settings.USE_BEDROCK:
-        from anthropic import AsyncAnthropicBedrock
+    global _async_client
+    if _async_client is None:
+        if settings.USE_BEDROCK:
+            from anthropic import AsyncAnthropicBedrock
 
-        return AsyncAnthropicBedrock(**_bedrock_kwargs())
-    from anthropic import AsyncAnthropic
+            _async_client = AsyncAnthropicBedrock(**_bedrock_kwargs())
+        else:
+            from anthropic import AsyncAnthropic
 
-    return AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+            _async_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+    return _async_client
+
+
+async def close_clients() -> None:
+    """Close cached clients on shutdown (no-op if never created)."""
+    global _async_client
+    if _async_client is not None:
+        try:
+            await _async_client.close()
+        finally:
+            _async_client = None
 
 
 def get_model() -> str:

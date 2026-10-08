@@ -13,3 +13,4 @@ outputs
 .git
 .gitignore
 *.md
+!skills/**/*.md

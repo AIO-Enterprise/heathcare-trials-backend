@@ -59,7 +59,7 @@ async def upload_logo(
     safe_ext = re.sub(r"[^A-Za-z0-9]", "", ext)[:8] or "png"
     filename = f"{user.company_id}_{uuid.uuid4().hex}.{safe_ext}"
 
-    logo_url = await file_storage.save(
+    logo_url = file_storage.save(
         file=file,
         subfolder="logos",
         filename=filename,
@@ -153,7 +153,7 @@ async def upload_brand_pdf(
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
 
     filename = f"{user.company_id}_{uuid.uuid4().hex}.pdf"
-    pdf_path = await file_storage.save(
+    pdf_path = file_storage.save(
         file=file,
         subfolder="brand-pdfs",
         filename=filename,

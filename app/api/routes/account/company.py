@@ -5,6 +5,8 @@ GET  /company/profile   — Return company info (name, industry, locations)
 PATCH /company/locations — Update operating locations
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -14,6 +16,8 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.core.security import require_roles, verify_password
 from app.db.database import get_db
 from app.models.models import Company, User, UserRole
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/company", tags=["Company"])
 
@@ -70,6 +74,7 @@ async def update_locations(
 ):
     result = await db.execute(select(Company).where(Company.id == user.company_id))
     company = result.scalar_one()
+    logger.info("Updating locations for company=%s count=%d", user.company_id, len(body.locations))
     company.locations = [loc.model_dump() for loc in body.locations]
     flag_modified(company, "locations")
     await db.flush()
@@ -93,6 +98,7 @@ async def delete_account(
     Cascade deletes handle users, documents, campaigns, brand kit, skills, etc.
     """
     if not verify_password(body.password, user.hashed_pw):
+        logger.warning("Account deletion refused — bad password for user=%s", user.id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect password. Account not deleted.",
@@ -103,6 +109,7 @@ async def delete_account(
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
 
+    logger.warning("Deleting company=%s and all data — requested by user=%s", user.company_id, user.id)
     await db.delete(company)
     # flush so cascade deletes run before commit
     await db.flush()

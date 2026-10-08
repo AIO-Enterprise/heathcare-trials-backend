@@ -1,6 +1,4 @@
 import logging
-import os
-import shutil
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -11,7 +9,7 @@ from app.db.database import get_db
 from app.models.models import AdStatus, Advertisement, Review, User, UserRole
 from app.schemas.schemas import AdvertisementCreate, AdvertisementOut, AdvertisementUpdate
 from app.services.ai.voicebot_agent import VoicebotAgentService
-from app.services.storage.extractor import BACKEND_ROOT
+from app.services.storage import file_storage
 
 router = APIRouter(prefix="/advertisements", tags=["Advertisements"])
 logger = logging.getLogger(__name__)
@@ -195,21 +193,19 @@ async def delete_advertisement(
         except Exception as exc:
             logger.warning("Could not delete ElevenLabs agent for ad %s: %s", ad_id, exc)
 
-    outputs_dir = os.path.normpath(os.path.join(BACKEND_ROOT, "outputs", user.company_id, ad_id))
-    if os.path.isdir(outputs_dir):
-        try:
-            shutil.rmtree(outputs_dir)
-            logger.info("Deleted output files at %s", outputs_dir)
-        except Exception as exc:
-            logger.warning("Could not delete output files for ad %s: %s", ad_id, exc)
+    outputs_prefix = f"outputs/{user.company_id}/{ad_id}"
+    try:
+        file_storage.delete_prefix(outputs_prefix)
+        logger.info("Deleted output files at %s", outputs_prefix)
+    except Exception as exc:
+        logger.warning("Could not delete output files for ad %s: %s", ad_id, exc)
 
-    docs_dir = os.path.normpath(os.path.join(BACKEND_ROOT, "uploads", "docs", user.company_id, ad_id))
-    if os.path.isdir(docs_dir):
-        try:
-            shutil.rmtree(docs_dir)
-            logger.info("Deleted protocol docs at %s", docs_dir)
-        except Exception as exc:
-            logger.warning("Could not delete protocol docs for ad %s: %s", ad_id, exc)
+    docs_prefix = f"uploads/docs/{user.company_id}/{ad_id}"
+    try:
+        file_storage.delete_prefix(docs_prefix)
+        logger.info("Deleted protocol docs at %s", docs_prefix)
+    except Exception as exc:
+        logger.warning("Could not delete protocol docs for ad %s: %s", ad_id, exc)
 
     await db.delete(ad)
     await db.commit()

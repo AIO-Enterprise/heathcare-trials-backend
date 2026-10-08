@@ -10,10 +10,11 @@ Supported formats:
   .doc         — not supported (binary format); returns None
 
 Usage:
-    from app.services.storage.extractor import extract_text
-    text = extract_text("/abs/path/to/file.pdf")
+    from app.services.storage.extractor import extract_bytes
+    text = extract_bytes(b"%PDF...", "file.pdf")
 """
 
+import io
 import logging
 import os
 
@@ -23,88 +24,33 @@ logger = logging.getLogger(__name__)
 _MAX_CHARS = 50_000
 
 
-def extract_text(abs_path: str) -> str | None:
-    """
-    Extract plain text from a file on disk.
-
-    Args:
-        abs_path: absolute filesystem path to the file
-
-    Returns:
-        Extracted text string, or None if extraction fails / unsupported format.
-    """
-    if not abs_path or not os.path.exists(abs_path):
+def extract_bytes(data: bytes, filename: str) -> str | None:
+    """Same as extract_text but from in-memory bytes (provider-agnostic)."""
+    if not data:
         return None
-
-    ext = os.path.splitext(abs_path)[1].lower()
-
+    ext = os.path.splitext(filename)[1].lower()
     try:
         if ext in (".txt", ".md"):
-            return _read_text(abs_path)
+            return data.decode("utf-8", errors="replace")[:_MAX_CHARS]
         elif ext == ".pdf":
-            return _read_pdf(abs_path)
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                logger.warning("pypdf not installed — cannot extract PDF content")
+                return None
+            pages = [p.extract_text().strip() for p in PdfReader(io.BytesIO(data)).pages if p.extract_text()]
+            return "\n\n".join(pages)[:_MAX_CHARS]
         elif ext == ".docx":
-            return _read_docx(abs_path)
+            try:
+                from docx import Document
+            except ImportError:
+                logger.warning("python-docx not installed — cannot extract DOCX content")
+                return None
+            paragraphs = [p.text for p in Document(io.BytesIO(data)).paragraphs if p.text.strip()]
+            return "\n\n".join(paragraphs)[:_MAX_CHARS]
         else:
             logger.warning("Unsupported file type for extraction: %s", ext)
             return None
     except Exception as exc:
-        logger.error("Content extraction failed for %s: %s", abs_path, exc)
+        logger.error("Content extraction failed for %s: %s", filename, exc)
         return None
-
-
-def _read_text(path: str) -> str:
-    with open(path, encoding="utf-8", errors="replace") as f:
-        return f.read()[:_MAX_CHARS]
-
-
-def _read_pdf(path: str) -> str:
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        logger.warning("pypdf not installed — cannot extract PDF content")
-        return None
-
-    reader = PdfReader(path)
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            pages.append(text.strip())
-    return "\n\n".join(pages)[:_MAX_CHARS]
-
-
-def _read_docx(path: str) -> str:
-    try:
-        from docx import Document
-    except ImportError:
-        logger.warning("python-docx not installed — cannot extract DOCX content")
-        return None
-
-    doc = Document(path)
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    return "\n\n".join(paragraphs)[:_MAX_CHARS]
-
-
-def url_to_disk_path(file_url: str, backend_root: str) -> str | None:
-    """
-    Convert a stored URL like '/uploads/docs/company/file.pdf'
-    to an absolute disk path.
-
-    Args:
-        file_url:     the value stored in DB (e.g. '/uploads/docs/.../file.pdf')
-        backend_root: absolute path to the backend root directory
-
-    Returns:
-        Absolute path string, or None if the URL cannot be resolved.
-    """
-    if not file_url:
-        return None
-    relative = file_url.lstrip("/").removeprefix("uploads/")
-    return os.path.join(backend_root, "uploads", relative)
-
-
-# Resolve backend root from this file's location
-# extractor.py lives at backend/app/services/storage/extractor.py
-# → 4 levels up = backend/
-BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))

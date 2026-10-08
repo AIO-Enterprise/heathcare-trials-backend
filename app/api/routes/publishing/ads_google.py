@@ -18,7 +18,6 @@ from app.core.exceptions import AppError
 from app.core.security import get_company_ad_or_404, require_roles
 from app.db.database import get_db
 from app.models.models import AdStatus, PlatformConnection, User, UserRole
-from app.services.storage.extractor import BACKEND_ROOT
 
 router = APIRouter(prefix="/advertisements", tags=["Google Ads"])
 logger = logging.getLogger(__name__)
@@ -142,7 +141,6 @@ async def distribute_to_google(
             daily_budget_usd=daily_budget,
             destination_url=destination_url,
             targeting_countries=targeting_countries,
-            backend_root=str(BACKEND_ROOT),
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

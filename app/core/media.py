@@ -10,9 +10,14 @@ BACKEND_PUBLIC_URL to the Container App domain so media URLs are absolute.
 
 from app.core.config import settings
 
+# ponytail: allowlist, not startswith("/") — anything outside these stays untouched so DB junk never becomes a link
+_ABSOLUTE_PREFIXES = ("/outputs/", "/uploads/", "/static/", "/api/")
+
 
 def media_url(path: str) -> str:
-    """Prefix an /outputs/... path with BACKEND_PUBLIC_URL if configured."""
+    """Prefix a backend-served path with BACKEND_PUBLIC_URL if configured."""
+    if not path.startswith(_ABSOLUTE_PREFIXES):
+        return path
     base = (settings.BACKEND_PUBLIC_URL or "").rstrip("/")
     return f"{base}{path}" if base else path
 

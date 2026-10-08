@@ -14,6 +14,7 @@ demographics reached, ethical considerations, admin reviews.
 """
 
 import json
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -31,6 +32,8 @@ from app.models.models import (
     Review,
 )
 from app.services.ai.skills import get_skill_config
+
+logger = logging.getLogger(__name__)
 
 
 class ReinforcementService:
@@ -50,6 +53,7 @@ class ReinforcementService:
         Record an optimization outcome and trigger the learning cycle.
         Called when a human accepts/rejects optimizer suggestions.
         """
+        logger.info("Recording outcome for ad=%s decision=%s", advertisement_id, decision)
         # Gather all feedback sources
         raw_data = await self._gather_feedback(advertisement_id, optimizer_log, decision)
 
@@ -73,6 +77,7 @@ class ReinforcementService:
         await self._append_lessons_to_skills(formalized)
 
         rl_log.applied_to_skill = True
+        logger.info("Reinforcement cycle complete for ad=%s", advertisement_id)
 
     async def process_ethics_review(
         self,
@@ -80,6 +85,7 @@ class ReinforcementService:
         review: Review,
     ):
         """Process an ethics review into the learning system."""
+        logger.info("Processing ethics review into RL for ad=%s", advertisement_id)
         raw_data = {
             "source": "ethics_review",
             "advertisement_id": advertisement_id,
@@ -179,8 +185,10 @@ Produce a structured reference document covering:
 """
 
         if not self.ai.is_configured():
+            logger.warning("AI client not configured — returning mock formalized document")
             return self._mock_formalized(raw_data)
 
+        logger.info("Formalizing RL feedback document via AI")
         return await self.ai.complete(
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
@@ -206,6 +214,7 @@ Produce a structured reference document covering:
 
     async def _append_lessons_to_skills(self, formalized: str):
         """Append lessons to the Lessons Learned section of both skills."""
+        logger.info("Appending lessons to curator and reviewer skills for company=%s", self.company_id)
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
         lesson_entry = f"\n\n### [{timestamp}]\n{formalized}"
 

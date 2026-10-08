@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 
 from sqlalchemy import select
@@ -13,6 +14,8 @@ from app.core.exceptions import NotFoundError
 from app.db.database import async_session_factory
 from app.models.models import Company, CompanyDocument, SkillConfig
 from app.schemas.schemas import TrainingStatus
+
+logger = logging.getLogger(__name__)
 
 _is_postgres = settings.DATABASE_URL.startswith("postgresql")
 
@@ -33,7 +36,7 @@ def load_file(path: str) -> str:
 
 
 def call_trainer(client, trainer_skill: str, template: str, company_data: dict) -> str:
-    print("    Calling Claude...")
+    logger.info("Calling Claude for skill training...")
     response = client.messages.create(
         model=get_model(),
         max_tokens=4096,
@@ -61,6 +64,7 @@ class TrainingService:
         self.db = db
 
     async def train_company_skills(self, company_id: str) -> TrainingStatus:
+        logger.info("Training skills for company %s...", company_id)
         # ── Phase 1: read-only DB fetch (hold connection briefly) ────────────
         async with async_session_factory() as read_db:
             result = await read_db.execute(select(Company).where(Company.id == company_id))
@@ -91,7 +95,7 @@ class TrainingService:
         filled_skills: dict[str, str] = {}
 
         for skill_name in TEMPLATES_TO_TRAIN:
-            print(f"  -> Training {skill_name} skill for company {company_name}...")
+            logger.info("Training %s skill for company %s...", skill_name, company_name)
             template_path = os.path.join(TEMPLATES_DIR, f"{skill_name}_template.md")
             template = load_file(template_path)
 
@@ -99,7 +103,7 @@ class TrainingService:
                 client = get_client()
                 filled = await asyncio.to_thread(call_trainer, client, trainer_skill, template, company_data)
             else:
-                print("    No AI backend configured, storing template as-is")
+                logger.info("No AI backend configured, storing template as-is")
                 filled = template
 
             filled_skills[skill_name] = filled
@@ -155,7 +159,7 @@ class TrainingService:
                     version = row.scalar_one()
 
                 skill_versions[skill_name] = version
-                print(f"  [OK] {skill_name} skill saved to DB (v{version})")
+                logger.info("[OK] %s skill saved to DB (v%s)", skill_name, version)
 
             await write_db.commit()
         # write_db session is closed here

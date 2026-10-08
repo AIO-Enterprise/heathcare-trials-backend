@@ -11,7 +11,7 @@ class LoginRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    access_token: str
+    access_token: str | None = None  # ponytail: cookie is the source of truth; field kept one release for old JS, then deleted
     token_type: str = "bearer"
     role: UserRoleEnum
     company_id: str

@@ -25,6 +25,7 @@ from urllib.parse import urlencode
 import requests as _requests
 
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
+from app.services.storage import file_storage
 
 logger = logging.getLogger(__name__)
 
@@ -270,10 +271,9 @@ class GoogleAdsService:
         )
         return result["results"][0]["resourceName"]
 
-    def upload_image_asset(self, disk_path: str, asset_name: str) -> str:
-        """Upload an image file as a Google Ads asset and return its resource name."""
-        with open(disk_path, "rb") as f:
-            image_data = base64.b64encode(f.read()).decode()
+    def upload_image_asset(self, image_bytes: bytes, asset_name: str) -> str:
+        """Upload image bytes as a Google Ads asset and return its resource name."""
+        image_data = base64.b64encode(image_bytes).decode()
 
         result = self._post(
             "assets:mutate",
@@ -586,7 +586,6 @@ class GoogleAdsService:
         daily_budget_usd: float,
         destination_url: str,
         targeting_countries: list[str],
-        backend_root: str,
         existing_campaign_id: str | None = None,
     ) -> dict:
         """
@@ -634,15 +633,10 @@ class GoogleAdsService:
         # 4. For each creative: upload image → create ad
         ad_ids = []
         for i, creative in enumerate(selected):
-            # Resolve image path
-            image_path = None
-            if creative.get("image_path"):
-                candidate = Path(backend_root) / creative["image_path"].lstrip("/")
-                if candidate.exists():
-                    image_path = str(candidate)
+            image_bytes = file_storage.open_bytes(creative.get("image_url") or "")
 
-            if not image_path:
-                logger.warning("Skipping creative %d — image file not found: %s", i, creative.get("image_path"))
+            if not image_bytes:
+                logger.warning("Skipping creative %d — image not found: %s", i, creative.get("image_url"))
                 continue
 
             headline = (creative.get("headline") or campaign_name)[:30]
@@ -652,7 +646,7 @@ class GoogleAdsService:
 
             asset_resource = await asyncio.to_thread(
                 self.upload_image_asset,
-                disk_path=image_path,
+                image_bytes,
                 asset_name=f"{campaign_name} Image {i + 1}",
             )
 

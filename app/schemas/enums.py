@@ -1,44 +1,12 @@
 """
-Pydantic-layer enums that mirror the SQLAlchemy enums in app.models.base.
-Values are identical; the classes differ only in naming convention.
+Pydantic-layer enums — single-sourced from app.models.base.
+
+The *Enum aliases below are the same StrEnum classes the ORM uses, so a
+value added in one layer can never drift from the other. Member names are
+UPPERCASE (e.g. UserRoleEnum.STUDY_COORDINATOR); values are unchanged.
 """
 
-from enum import StrEnum
-
-
-class UserRoleEnum(StrEnum):
-    study_coordinator = "study_coordinator"
-    project_manager = "project_manager"
-    ethics_manager = "ethics_manager"
-    publisher = "publisher"
-    super_user = "super_user"
-
-
-class AdTypeEnum(StrEnum):
-    website = "website"
-    ads = "ads"
-    voicebot = "voicebot"
-    chatbot = "chatbot"
-
-
-class AdStatusEnum(StrEnum):
-    draft = "draft"
-    generating = "generating"
-    strategy_created = "strategy_created"
-    under_review = "under_review"
-    ethics_review = "ethics_review"
-    approved = "approved"
-    published = "published"
-    paused = "paused"
-    optimizing = "optimizing"
-
-
-class DocumentTypeEnum(StrEnum):
-    usp = "usp"
-    compliance = "compliance"
-    policy = "policy"
-    marketing_goal = "marketing_goal"
-    ethical_guideline = "ethical_guideline"
-    reference = "reference"
-    protocol = "protocol"
-    input = "input"
+from app.models.base import AdStatus as AdStatusEnum  # noqa: F401
+from app.models.base import AdType as AdTypeEnum  # noqa: F401
+from app.models.base import DocumentType as DocumentTypeEnum  # noqa: F401
+from app.models.base import UserRole as UserRoleEnum  # noqa: F401

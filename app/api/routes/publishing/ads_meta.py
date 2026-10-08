@@ -14,7 +14,6 @@ from app.core.exceptions import AppError
 from app.core.security import get_company_ad_or_404, require_roles
 from app.db.database import get_db
 from app.models.models import AdStatus, PlatformConnection, User, UserRole
-from app.services.storage.extractor import BACKEND_ROOT
 
 router = APIRouter(prefix="/advertisements", tags=["Meta Ads"])
 logger = logging.getLogger(__name__)
@@ -98,8 +97,15 @@ async def distribute_to_meta(
     try:
         age_min = int(cfg.get("age_min") or 18)
         age_max = int(cfg.get("age_max") or 65)
-    except (TypeError, ValueError):
-        age_min, age_max = 18, 65
+        if not (13 <= age_min <= age_max <= 65):
+            raise ValueError("age out of 13–65 range")
+    except (TypeError, ValueError) as exc:
+        # Fail closed: never silently publish a healthcare ad to a
+        # coerced age range — block and tell the publisher what to fix.
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid targeting age — check config age_min/age_max: {exc}",
+        )
 
     conn = await _load_meta_conn(db, user.company_id)
 
@@ -180,7 +186,6 @@ async def distribute_to_meta(
             daily_budget_usd=daily_budget,
             destination_url=destination_url,
             targeting_countries=targeting_countries,
-            backend_root=str(BACKEND_ROOT),
             display_url=display_url,
             addon_type=addon_type,
             addon_phone=addon_phone,

@@ -9,6 +9,7 @@ Calls Claude API to produce strategy JSON.
 """
 
 import json
+import logging
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +18,8 @@ from app.core.config import settings
 from app.core.llm import extract_json, get_ai_client
 from app.models.models import Advertisement, CompanyDocument, DocumentType
 from app.services.ai.skills import load_skill
+
+logger = logging.getLogger(__name__)
 
 
 class CuratorService:
@@ -41,6 +44,7 @@ class CuratorService:
         3. Call Claude API with the skill as system prompt
         4. Parse and return strategy JSON
         """
+        logger.info("CuratorService.generate_strategy — ad=%s company=%s docs=%d", advertisement.id, self.company_id, len(company_docs))
         # Step 1: Load customized skill
         skill_md = await load_skill(self.db, self.company_id, "curator")
 
@@ -48,8 +52,10 @@ class CuratorService:
         context = self._build_context(advertisement, company_docs, extra_instructions=extra_instructions)
 
         # Step 3: Call Claude API
+        logger.info("Calling curator model for ad=%s", advertisement.id)
         strategy = await self._call_claude(skill_md, context)
 
+        logger.info("Strategy generated for ad=%s parse_error=%s", advertisement.id, strategy.get("parse_error", False))
         return strategy
 
     def _build_context(
@@ -127,6 +133,7 @@ Respond ONLY with the JSON object, no additional text.
     async def _call_claude(self, system_prompt: str, user_message: str) -> dict[str, Any]:
         """Call the curator model (Opus tier) with the skill as system prompt."""
         if not self.ai.is_configured():
+            logger.warning("AI client not configured — returning mock strategy")
             return self._mock_strategy()
 
         text = await self.ai.complete(
@@ -140,6 +147,7 @@ Respond ONLY with the JSON object, no additional text.
         try:
             return extract_json(text)
         except json.JSONDecodeError:
+            logger.error("Failed to parse curator response as JSON — raw length=%d", len(text))
             return {"raw_response": text, "parse_error": True}
 
     async def generate_questionnaire(
@@ -151,7 +159,9 @@ Respond ONLY with the JSON object, no additional text.
         Generate an MCQ eligibility/screening questionnaire using Claude.
         Returns {"questions": [{id, text, type, options, required}]}
         """
+        logger.info("Generating questionnaire for ad=%s", advertisement.id)
         if not self.ai.is_configured():
+            logger.warning("AI client not configured — returning mock questionnaire")
             return self._mock_questionnaire(advertisement.title)
 
         # Build focused context
@@ -202,8 +212,11 @@ Return ONLY a JSON object in this exact format:
             max_tokens=2048,
         )
         try:
-            return extract_json(text)
+            result = extract_json(text)
+            logger.info("Questionnaire generated for ad=%s questions=%d", advertisement.id, len(result.get("questions", [])))
+            return result
         except json.JSONDecodeError:
+            logger.error("Failed to parse questionnaire response as JSON for ad=%s", advertisement.id)
             return {"questions": [], "parse_error": True}
 
     async def rewrite_question(

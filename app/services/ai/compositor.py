@@ -18,10 +18,13 @@ All layouts render:
 """
 
 import io
+import logging
 import os
 import re
 
 from PIL import Image, ImageDraw, ImageFont
+
+logger = logging.getLogger(__name__)
 
 # ── Font paths ────────────────────────────────────────────────────────────────
 
@@ -522,6 +525,7 @@ def composite_ad(
     canvas_h: int = 1920,
 ) -> bytes:
     style = layout.get("layout_style", "dark_panel_top")
+    logger.info("Compositing ad image — style=%s size=%dx%d", style, canvas_w, canvas_h)
     if style == "photo_top":
         return _layout_photo_top(photo_bytes, layout, canvas_w, canvas_h)
     if style == "full_bleed":

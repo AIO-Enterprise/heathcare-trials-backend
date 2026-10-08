@@ -21,7 +21,7 @@ from app.models.models import SkillConfig
 
 logger = logging.getLogger(__name__)
 
-_SKILLS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "skills", "templates"))
+_SKILLS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "skills", "templates"))
 
 
 async def get_skill_config(db: AsyncSession, company_id: str, skill_type: str) -> SkillConfig | None:

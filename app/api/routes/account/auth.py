@@ -10,21 +10,39 @@ POST /auth/request-password-change  — Send OTP to authenticated user's email
 POST /auth/confirm-password-change  — Validate OTP and set new password
 """
 
+import logging
 import random
 import string
+import time
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.security import create_access_token, get_current_user, hash_password, verify_password
 from app.db.database import get_db
 from app.models.models import Company, PasswordResetCode, User
 from app.schemas.schemas import ConfirmPasswordChangeRequest, LoginRequest, TokenResponse
 from app.services.messaging.email_service import send_otp_email
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+def _set_auth_cookies(response: Response, token: str) -> None:
+    max_age = settings.JWT_EXPIRE_MINUTES * 60
+    secure = settings.APP_ENV == "prod"
+    response.set_cookie("access_token", token, httponly=True, secure=secure, samesite="lax", path="/", max_age=max_age)
+    # ponytail: readable expiry lets JS schedule refresh without decoding the JWT; non-secret Unix timestamp
+    response.set_cookie("token_exp", str(int(time.time()) + max_age), httponly=False, secure=secure, samesite="lax", path="/", max_age=max_age)
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("token_exp", path="/")
 
 
 def _token_response(user: User, company: Company, token: str) -> TokenResponse:
@@ -42,16 +60,18 @@ def _token_response(user: User, company: Company, token: str) -> TokenResponse:
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(body: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)):
     """
     Role-based user sign-in.
     Verifies email, password, company name, and role.
     All failures return a generic 401 to avoid leaking information.
     """
+    logger.info("Login attempt for email=%s role=%s", body.email, body.role)
     result = await db.execute(select(User).where(User.email == body.email))
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(body.password, user.hashed_pw):
+        logger.warning("Failed login for email=%s — bad credentials", body.email)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     if not user.is_active:
@@ -64,9 +84,14 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     company = company_result.scalar_one_or_none()
 
     if not company or company.name.lower() != body.company.strip().lower():
+        logger.warning("Failed login for email=%s — company mismatch", body.email)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-    token = create_access_token(user_id=user.id, role=user.role.value, company_id=user.company_id)
+    token = create_access_token(
+        user_id=user.id, role=user.role.value, company_id=user.company_id, token_version=user.token_version or 0
+    )
+    logger.info("Login success user=%s role=%s company=%s", user.id, user.role.value, user.company_id)
+    _set_auth_cookies(response, token)
     return _token_response(user, company, token)
 
 
@@ -84,6 +109,7 @@ async def check_email(
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(
+    response: Response,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -96,8 +122,32 @@ async def refresh_token(
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
 
-    token = create_access_token(user_id=user.id, role=user.role.value, company_id=user.company_id)
+    token = create_access_token(
+        user_id=user.id, role=user.role.value, company_id=user.company_id, token_version=user.token_version or 0
+    )
+    _set_auth_cookies(response, token)
     return _token_response(user, company, token)
+
+
+@router.post("/logout", status_code=200)
+async def logout(response: Response):
+    """Clear auth cookies. Caller is signed out on this browser."""
+    _clear_auth_cookies(response)
+    return {"detail": "Signed out"}
+
+
+@router.post("/logout-all", status_code=200)
+async def logout_all(
+    response: Response,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke every session for the caller (all devices). Caller must sign in again."""
+    logger.info("Revoking all sessions for user=%s", user.id)
+    user.token_version = (user.token_version or 0) + 1
+    await db.flush()
+    _clear_auth_cookies(response)
+    return {"detail": "All sessions revoked — please sign in again"}
 
 
 # ─── Password Change (authenticated, email-verified) ──────────────────────────
@@ -124,6 +174,7 @@ async def request_password_change(
     db.add(PasswordResetCode(user_id=current_user.id, code=code, expires_at=expires_at))
     await db.flush()
 
+    logger.info("OTP requested for user=%s", current_user.id)
     await send_otp_email(current_user.email, current_user.full_name, code)
     return {"detail": "OTP sent"}
 
@@ -146,8 +197,10 @@ async def confirm_password_change(
 
     now = datetime.now(UTC).replace(tzinfo=None)
     if not otp or otp.expires_at < now:
+        logger.warning("Invalid/expired OTP for user=%s", current_user.id)
         raise HTTPException(status_code=422, detail="Invalid or expired verification code.")
 
     otp.used = True
     current_user.hashed_pw = hash_password(body.new_password)
+    logger.info("Password changed for user=%s", current_user.id)
     return {"detail": "Password updated successfully."}

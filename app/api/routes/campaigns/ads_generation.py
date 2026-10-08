@@ -66,19 +66,23 @@ async def _bg_generate_strategy(ad_id: str, company_id: str) -> None:
     """Background task: run Curator + Questionnaire, update ad when done."""
     from app.db.database import async_session_factory
 
+    logger.info("Strategy generation starting for ad %s", ad_id)
     try:
         async with async_session_factory() as db:
             result = await db.execute(select(Advertisement).where(Advertisement.id == ad_id))
             ad = result.scalar_one_or_none()
             if not ad:
+                logger.warning("Strategy generation aborted — ad %s not found", ad_id)
                 return
 
             all_docs = await _load_all_docs(db, ad_id, company_id)
+            logger.info("Strategy generation: loaded %d docs for ad %s — calling Bedrock", len(all_docs), ad_id)
             curator = CuratorService(db, company_id)
             strategy, questionnaire = await asyncio.gather(
                 curator.generate_strategy(ad, all_docs),
                 curator.generate_questionnaire(ad, all_docs),
             )
+            logger.info("Strategy generation: Bedrock returned for ad %s", ad_id)
 
             if strategy.get("parse_error"):
                 logger.error("Strategy parse error for ad %s: %s", ad_id, strategy.get("raw_response", "")[:200])
@@ -112,6 +116,7 @@ async def _bg_generate_strategy(ad_id: str, company_id: str) -> None:
                     )
 
             await db.commit()
+            logger.info("Strategy generation complete for ad %s — status → %s", ad_id, ad.status.value)
     except Exception as e:
         logger.error("Background strategy generation failed for ad %s: %s", ad_id, e, exc_info=True)
         try:
@@ -598,9 +603,7 @@ async def serve_website(
     Serve the generated HTML landing page — public, no auth required.
     ?download=true → Content-Disposition: attachment (triggers browser download).
     """
-    import os as _os
-
-    from app.core.config import settings as _s
+    from app.services.storage import file_storage
 
     result = await db.execute(select(Advertisement).where(Advertisement.id == ad_id))
     ad = result.scalar_one_or_none()
@@ -609,14 +612,10 @@ async def serve_website(
     if not ad.output_url:
         raise HTTPException(status_code=404, detail="No website has been generated for this campaign yet")
 
-    relative = media_to_disk(ad.output_url)
-    disk_path = _os.path.join(_s.OUTPUT_DIR, relative)
-
-    if not _os.path.exists(disk_path):
+    raw = file_storage.open_bytes(ad.output_url)
+    if raw is None:
         raise HTTPException(status_code=404, detail="Website file not found on disk")
-
-    with open(disk_path, encoding="utf-8") as f:
-        html_content = f.read()
+    html_content = raw.decode("utf-8", errors="replace")
 
     if download:
         return Response(

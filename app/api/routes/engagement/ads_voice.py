@@ -11,16 +11,17 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ValidationError, field_validator
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.engagement.bookings import _booking_config, _campaign_window, _generate_slots
+from app.api.routes.engagement.voice_webhook import _verify_signature as _verify_el_signature
 from app.core.config import settings
 from app.core.exceptions import AppError
-from app.core.security import get_company_ad_or_404, require_roles
+from app.core.security import create_access_token, get_company_ad_or_404, get_current_user, require_roles
 from app.core.timeutils import ad_zone, naive_now, today_in
 from app.db.database import get_db
 from app.models.models import Advertisement, User, UserRole
@@ -152,13 +153,20 @@ async def _available_slots_for_date(
 @router.post("/{ad_id}/voice-agent/check-slots")
 async def voice_check_slots(
     ad_id: str,
-    body: VoiceCheckSlotsRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
     Webhook called by ElevenLabs to check available slots for a given date.
     Returns a spoken-friendly list of times the agent can read to the caller.
     """
+    raw = await request.body()
+    if not _verify_el_signature(raw, request.headers.get("ElevenLabs-Signature", "")):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        body = VoiceCheckSlotsRequest.model_validate_json(raw)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Invalid request body")
     ad = await db.get(Advertisement, ad_id)
     if not ad:
         return {"message": "Sorry, I couldn't find the campaign details. Please call us back."}
@@ -222,7 +230,7 @@ async def voice_check_slots(
 @router.post("/{ad_id}/voice-agent/book-slot")
 async def voice_book_slot(
     ad_id: str,
-    body: VoiceBookRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -230,6 +238,13 @@ async def voice_book_slot(
     The agent must have already called check_available_slots and presented real
     options — this endpoint books the exact date + time the caller chose.
     """
+    raw = await request.body()
+    if not _verify_el_signature(raw, request.headers.get("ElevenLabs-Signature", "")):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        body = VoiceBookRequest.model_validate_json(raw)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Invalid request body")
     ad = await db.get(Advertisement, ad_id)
     if not ad:
         return {"message": "Sorry, I couldn't find the campaign details. Please call us back to book manually."}
@@ -424,6 +439,16 @@ async def request_voice_call(
     Trigger an outbound phone call to the user's cell via ElevenLabs.
     No auth required — embedded in published landing pages.
     """
+    # Fraud control: cap billable outbound dials per campaign per hour.
+    # (Counts all voice sessions conservatively — browser sessions included.)
+    _recent = await db.execute(
+        select(func.count(VoiceSession.id)).where(
+            VoiceSession.advertisement_id == ad_id,
+            VoiceSession.started_at >= datetime.utcnow() - timedelta(hours=1),
+        )
+    )
+    if (_recent.scalar_one() or 0) >= 50:
+        raise HTTPException(status_code=429, detail="Call volume limit reached for this campaign.")
     svc = VoicebotAgentService(db)
     try:
         result = await svc.outbound_call(ad_id, body.phone_number)
@@ -483,6 +508,23 @@ async def get_voice_session_token(
         logger.exception("Signed URL fetch failed for %s", ad_id)
         raise HTTPException(status_code=502, detail="ElevenLabs error")
     return {"signed_url": signed_url}
+
+
+@router.get("/{ad_id}/voice-ws-url")
+async def get_hybrid_voice_ws_url(
+    ad_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Absolute first-party WS URL — browser WebSocket can't set headers, so the ticket rides in query."""
+    await get_company_ad_or_404(db, user, ad_id)
+    token = create_access_token(
+        user_id=user.id, role=user.role.value, company_id=user.company_id, token_version=user.token_version or 0
+    )
+    base = (settings.BACKEND_PUBLIC_URL or "").rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
+    # ponytail: relative fallback serves same-origin dev; prod sets BACKEND_PUBLIC_URL (fail-fast in main)
+    path = f"/api/advertisements/{ad_id}/voice/ws?token={token}"
+    return {"ws_url": f"{base}{path}" if base else path}
 
 
 @router.get("/voice-profiles/australian")

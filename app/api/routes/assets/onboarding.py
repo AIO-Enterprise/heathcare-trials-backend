@@ -30,7 +30,7 @@ from app.schemas.schemas import (
     OnboardingResponse,
 )
 from app.services.storage import file_storage, sanitize_filename
-from app.services.storage.extractor import BACKEND_ROOT, extract_text, url_to_disk_path
+from app.services.storage.extractor import extract_bytes
 from app.services.training.trainer import TrainingService
 
 
@@ -133,7 +133,7 @@ async def upload_document(
     if file:
         safe_name = _safe_filename(file.filename)
         try:
-            file_path = await file_storage.save(
+            file_path = file_storage.save(
                 file=file,
                 subfolder=f"docs/{user.company_id}",
                 filename=safe_name,
@@ -152,13 +152,14 @@ async def upload_document(
             )
 
         if not content:
-            disk_path = url_to_disk_path(file_path, BACKEND_ROOT)
             try:
-                content = await asyncio.to_thread(extract_text, disk_path)
+                content = await asyncio.to_thread(
+                    extract_bytes, file_storage.open_bytes(file_path), file_path
+                )
             except Exception as exc:
                 logger.warning(
                     "Onboarding upload: extract_text failed for %s: %s — saving with empty content",
-                    disk_path,
+                    file_path,
                     exc,
                 )
                 content = None
