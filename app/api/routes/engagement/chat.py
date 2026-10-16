@@ -7,7 +7,7 @@ Flow:
     → load Advertisement from DB (in-memory TTL cache)
     → find or create ChatSession for (campaignId, sessionId)
     → build system prompt strictly from THIS campaign's data
-    → call GPT-5 via Azure OpenAI (falls back to Anthropic if Azure not configured)
+    → call the chat-slot LLM (Azure when AZURE_CHAT_* is set, else Bedrock)
     → persist updated message history to ChatSession
     → return { reply, sessionId }
 
@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,30 +43,49 @@ from app.models.models import Advertisement, ChatSession
 from app.models.survey import Appointment
 
 
-def _get_chat_client():
-    """Return async OpenAI-compatible client for the chat widget.
+def _foundry_base_url(url: str) -> str:
+    """Root for the Foundry OpenAI v1 data plane (".../openai/v1")."""
+    parsed = urlparse((url or "").strip())
+    root = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else (url or "").strip().rstrip("/")
+    path = parsed.path or ""
+    if "/openai/v1" in path:
+        return root + path[: path.index("/openai/v1") + len("/openai/v1")]
+    return root + "/openai/v1"
 
-    Priority:
-      1. AZURE_CHAT_ENDPOINT + AZURE_CHAT_API_KEY (dedicated chat resource)
-      2. AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY (shared resource fallback)
-      3. OPENAI_API_KEY (standard OpenAI)
-      4. None → fall back to Anthropic via bedrock helpers
+
+def _get_chat_client():
+    """Return (async OpenAI-compatible client, model) for the chat widget.
+
+    Strict per-slot fallback: AZURE_CHAT_API_URL + AZURE_CHAT_API_KEY +
+    AZURE_CHAT_MODEL set → Foundry (OpenAI v1 responses API); otherwise
+    (None, None) → the caller falls back to Bedrock (AWS_CHAT_MODEL).
+    No cross-slot inheritance.
     """
-    endpoint = settings.AZURE_CHAT_ENDPOINT or settings.AZURE_OPENAI_ENDPOINT
-    api_key = settings.AZURE_CHAT_API_KEY or settings.AZURE_OPENAI_API_KEY
-    if endpoint and api_key:
-        # Strip to base URL — SDK builds the deployment path itself.
-        # Handles both "https://resource.openai.azure.com" and full deployment URLs.
-        parsed = urlparse(endpoint)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
-        return AsyncAzureOpenAI(
-            azure_endpoint=base_url,
+    endpoint = (settings.AZURE_CHAT_API_URL or "").strip()
+    api_key = (settings.AZURE_CHAT_API_KEY or "").strip()
+    model = (settings.AZURE_CHAT_MODEL or "").strip()
+    if endpoint and api_key and model:
+        return AsyncOpenAI(
+            base_url=_foundry_base_url(endpoint),
             api_key=api_key,
-            api_version=settings.AZURE_OPENAI_API_VERSION,
+        ), model
+    return None, None
+
+
+def _responses_tools() -> list:
+    """Flatten CHAT_TOOLS_OPENAI (chat.completions shape) to Responses function tools."""
+    out = []
+    for tool in CHAT_TOOLS_OPENAI:
+        fn = tool.get("function", {})
+        out.append(
+            {
+                "type": "function",
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {}),
+            }
         )
-    if settings.OPENAI_API_KEY:
-        return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    return None
+    return out
 
 
 logger = logging.getLogger(__name__)
@@ -641,52 +660,53 @@ async def chat(
     messages = [{"role": m["role"], "content": m["content"]} for m in history]
     messages.append({"role": "user", "content": body.message})
 
-    # 5. Call GPT / Anthropic with booking tools enabled
-    oai_client = _get_chat_client()
+    # 5. Call chat-slot LLM with booking tools enabled
+    oai_client, oai_deployment = _get_chat_client()
     system_prompt = _build_system_prompt(ad)
     reply = ""
 
     if oai_client is not None:
         try:
-            oai_messages = [{"role": "system", "content": system_prompt}] + messages
-
-            # Tool-call loop — model may call check_available_slots / book_appointment
-            # before producing a final text reply.
+            # Tool-call loop (Responses API) — model may call
+            # check_available_slots / book_appointment before replying.
+            resp_input: list = list(messages)
             for _turn in range(5):  # safety cap to prevent infinite loops
-                response = await oai_client.chat.completions.create(
-                    model=settings.AZURE_CHAT_DEPLOYMENT,
-                    max_completion_tokens=1024,
-                    messages=oai_messages,
-                    tools=CHAT_TOOLS_OPENAI,
-                    tool_choice="auto",
+                response = await oai_client.responses.create(
+                    model=oai_deployment,
+                    instructions=system_prompt,
+                    input=resp_input,
+                    tools=_responses_tools(),
+                    max_output_tokens=1024,
                 )
-                choice = response.choices[0]
-
-                if choice.finish_reason == "tool_calls":
+                function_calls = [i for i in response.output if getattr(i, "type", "") == "function_call"]
+                if function_calls:
                     # Execute all tool calls, append results, then loop
-                    oai_messages.append(choice.message)  # assistant message with tool_calls
-                    for tc in choice.message.tool_calls:
-                        tool_args = json.loads(tc.function.arguments)
-                        tool_result = await _execute_chat_tool(tc.function.name, tool_args, campaign_id, db, session.id)
-                        oai_messages.append(
+                    resp_input.extend(function_calls)
+                    for fc in function_calls:
+                        try:
+                            tool_args = json.loads(fc.arguments or "{}")
+                        except (json.JSONDecodeError, TypeError):
+                            tool_args = {}
+                        tool_result = await _execute_chat_tool(fc.name, tool_args, campaign_id, db, session.id)
+                        resp_input.append(
                             {
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": tool_result,
+                                "type": "function_call_output",
+                                "call_id": fc.call_id,
+                                "output": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
                             }
                         )
                 else:
-                    reply = (choice.message.content or "").strip()
+                    reply = (response.output_text or "").strip()
                     break
             else:
                 reply = "I'm sorry, I ran into a problem processing your request. Please try again."
 
         except Exception as exc:
-            logger.error("Chat Azure/OpenAI error for campaign %s: %s", campaign_id, exc)
+            logger.error("Chat Foundry error for campaign %s: %s", campaign_id, exc)
             reply = "I'm sorry, I'm having a little trouble right now. Could you try again?"
             # Fall through — reply will be saved to history below so context is preserved.
 
-    elif is_configured():
+    elif is_configured("chat"):
         try:
             client = get_async_client()
             anthropic_messages = list(messages)
@@ -694,7 +714,7 @@ async def chat(
             # Tool-call loop for Anthropic
             for _turn in range(5):
                 response = await client.messages.create(
-                    model=get_model(),
+                    model=get_model("chat"),
                     max_tokens=1024,
                     system=system_prompt,
                     messages=anthropic_messages,

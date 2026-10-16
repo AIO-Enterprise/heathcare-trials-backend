@@ -57,6 +57,14 @@ _BUCKETS: dict[str, tuple[tuple[str, ...], tuple[str, ...] | None, int, int]] = 
         30,
         60,
     ),
+    # Anonymous brand-PDF extraction (onboarding runs it pre-signup; each hit
+    # can trigger one LLM call, so keep the budget tight).
+    "brand-extract": (
+        ("/api/brand-kit/extract-pdf",),
+        None,
+        10,
+        60,
+    ),
 }
 
 # (ip, bucket) → [count, window_start]

@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import secrets
+from urllib.parse import parse_qsl
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -61,7 +62,7 @@ def _norm_key(path: str) -> str:
     """Strip backend base URL + leading slash → object key ("uploads/a/b")."""
     from app.core.config import settings
 
-    base = (settings.BACKEND_PUBLIC_URL or "").rstrip("/")
+    base = settings.backend_base
     if base and path.startswith(base):
         path = path[len(base) :]
     return path.lstrip("/")
@@ -290,6 +291,13 @@ class AzureBlobStorageBackend(StorageBackend):
     def _blob(self, path: str):
         return self._client().get_blob_client(container=_bucket(), blob=_object_key(path))
 
+    def _account_key(self) -> str:
+        parts = dict(parse_qsl((settings.AZURE_STORAGE_CONNECTION_STRING or "").replace(";", "&"), keep_blank_values=True))
+        key = parts.get("AccountKey", "")
+        if not key:
+            raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is missing AccountKey for SAS generation")
+        return key
+
     def save_bytes(self, data: bytes, subfolder: str, filename: str) -> str:
         filename = sanitize_filename(filename)
         head, _, rest = (subfolder.strip("/") + "/").partition("/")
@@ -344,7 +352,7 @@ class AzureBlobStorageBackend(StorageBackend):
             account_name=self._client().account_name,
             container_name=_bucket(),
             blob_name=_object_key(stored),
-            account_key=self._client().credential.account_key,
+            account_key=self._account_key(),
             permission=BlobSasPermissions(write=True, create=True),
             expiry=datetime.now(UTC) + timedelta(hours=1),
             content_type=content_type,

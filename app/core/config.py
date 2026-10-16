@@ -36,47 +36,101 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 1440  # 24 hours — proactively refreshed by frontend
 
+    # Auth cookie transport. Dev default (lax + auto-secure) requires
+    # same-origin API calls (Vite proxy) — cross-site fetch silently drops
+    # Lax cookies, which looks like "login works then kicks me out".
+    # Split-origin prod (e.g. Static Web App → Container App) needs
+    # COOKIE_SAMESITE=none (forces Secure).
+    COOKIE_SAMESITE: str = "lax"
+    # None → Secure only in prod; True/False override explicitly.
+    COOKIE_SECURE: bool | None = None
+
     # Database
     DATABASE_URL: str = "sqlite+aiosqlite:///./marketing_platform.db"
 
-    # Anthropic (direct API)
-    ANTHROPIC_API_KEY: str | None = None
-    ANTHROPIC_MODEL: str = "claude-sonnet-4-5-20250514"
-    # Opus 4.5 — used exclusively for ad strategy generation (curator)
-    ANTHROPIC_CURATOR_MODEL: str = "claude-opus-4-5"
+    # Azure Foundry (GPT side) — per-activity triplets.
+    # Strict per-slot fallback: AZURE_{SLOT}_* set → Azure, else AWS_{SLOT}_MODEL.
+    # No cross-slot inheritance. AZURE_IMAGE_GEN_* drives image generation.
+    AZURE_CURATOR_API_URL: str = ""
+    AZURE_CURATOR_API_KEY: str = ""
+    AZURE_CURATOR_API_VERSION: str = ""
+    AZURE_CURATOR_MODEL: str = ""
+    AZURE_GENERIC_API_URL: str = ""
+    AZURE_GENERIC_API_KEY: str = ""
+    AZURE_GENERIC_API_VERSION: str = ""
+    AZURE_GENERIC_MODEL: str = ""
+    AZURE_CHAT_API_URL: str = ""
+    AZURE_CHAT_API_KEY: str = ""
+    AZURE_CHAT_API_VERSION: str = ""
+    AZURE_CHAT_MODEL: str = ""
+    AZURE_IMAGE_GEN_API_URL: str = ""
+    AZURE_IMAGE_GEN_API_KEY: str = ""
+    AZURE_IMAGE_GEN_VERSION: str = ""
+    AZURE_IMAGE_GEN_MODEL: str = ""
 
-    # AWS Bedrock
-    USE_BEDROCK: bool = False
+    # AWS Bedrock (Claude side) — shared creds, per-activity models.
+    # Credentials optional: boto3 falls back to its default chain
+    # (IAM role, ~/.aws/credentials, ECS task role, instance metadata).
     AWS_ACCESS_KEY_ID: str | None = None
     AWS_SECRET_ACCESS_KEY: str | None = None
     AWS_REGION: str = "us-east-1"
-    BEDROCK_MODEL: str = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-    # Opus 4.5 Bedrock ID — used exclusively for ad strategy generation (curator)
-    BEDROCK_CURATOR_MODEL: str = "us.anthropic.claude-opus-4-5-20251101-v1:0"
+    AWS_CURATOR_MODEL: str = ""
+    AWS_GENERIC_MODEL: str = ""
+    AWS_CHAT_MODEL: str = ""
+    # Reserved — Bedrock serves no images; image gen reads AZURE_IMAGE_GEN_* only.
+    AWS_IMAGE_GEN_MODEL: str = ""
 
-    # Chat widget model (Haiku — lightweight, fast, stays within Bedrock)
-    CHAT_MODEL: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    # Default Azure API version when a slot's VERSION field is blank.
+    AZURE_API_VERSION_DEFAULT: str = "2025-05-01-preview"
 
-    # Azure AI Foundry / Azure OpenAI
-    # Set AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY to use Azure Foundry.
-    # Leave blank to fall back to standard OpenAI (OPENAI_API_KEY).
-    AZURE_OPENAI_ENDPOINT: str | None = None
-    AZURE_OPENAI_API_KEY: str | None = None
-    AZURE_OPENAI_API_VERSION: str = "2025-05-01-preview"
-    # Azure OpenAI Chat (GPT-5) — separate resource from image gen if needed
-    # If blank, falls back to AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY
-    AZURE_CHAT_ENDPOINT: str | None = None
-    AZURE_CHAT_API_KEY: str | None = None
-    AZURE_CHAT_DEPLOYMENT: str = "gpt-5"
-    # Standard OpenAI fallback
-    OPENAI_API_KEY: str | None = None
-    OPENAI_IMAGE_MODEL: str = "gpt-image-1.5"
+    def _clean(self, value: str | None) -> str:
+        return (value or "").strip()
+
+    def azure_slot(self, slot: str) -> tuple[str, str, str, str]:
+        """Return (url, key, version, model) for a slot: curator|generic|chat."""
+        prefix = f"AZURE_{slot.upper()}"
+        url = self._clean(getattr(self, f"{prefix}_API_URL"))
+        key = self._clean(getattr(self, f"{prefix}_API_KEY"))
+        version = self._clean(getattr(self, f"{prefix}_API_VERSION")) or self.AZURE_API_VERSION_DEFAULT
+        model = self._clean(getattr(self, f"{prefix}_MODEL"))
+        return url, key, version, model
+
+    def is_azure_configured(self, slot: str) -> bool:
+        url, key, _, model = self.azure_slot(slot)
+        return bool(url and key and model)
+
+    def bedrock_model(self, slot: str) -> str:
+        """Return the Bedrock model for a slot: curator|generic|chat."""
+        return self._clean(getattr(self, f"AWS_{slot.upper()}_MODEL", ""))
+
+    @property
+    def backend_base(self) -> str:
+        """Canonical backend base URL (no trailing slash) — "" when unset."""
+        return self._clean(self.BACKEND_HOSTING_URL).rstrip("/")
+
+    def absolute_url(self, path_or_url: str) -> str:
+        """Join BACKEND_HOSTING_URL with a relative path; pass absolute URLs through."""
+        value = self._clean(path_or_url)
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+        base = self.backend_base
+        if not base:
+            return value
+        return f"{base}/{value.lstrip('/')}"
+
+    @property
+    def meta_redirect_uri(self) -> str:
+        return self.absolute_url(self.META_OAUTH_REDIRECT_URI)
+
+    @property
+    def google_redirect_uri(self) -> str:
+        return self.absolute_url(self.GOOGLE_ADS_OAUTH_REDIRECT_URI)
 
     # Meta for Developers – OAuth credentials for Facebook/Instagram ad publishing
     # Register your app at https://developers.facebook.com and add the Marketing API product.
     META_APP_ID: str | None = None
     META_APP_SECRET: str | None = None
-    META_OAUTH_REDIRECT_URI: str = "http://localhost:8000/api/platform-connections/meta/callback"
+    META_OAUTH_REDIRECT_URI: str = "/api/platform-connections/meta/callback"
 
     # Google Ads – OAuth credentials for Google Ads publishing
     # Create credentials at https://console.cloud.google.com → APIs & Services → Credentials
@@ -84,7 +138,7 @@ class Settings(BaseSettings):
     GOOGLE_ADS_CLIENT_ID: str | None = None
     GOOGLE_ADS_CLIENT_SECRET: str | None = None
     GOOGLE_ADS_DEVELOPER_TOKEN: str | None = None
-    GOOGLE_ADS_OAUTH_REDIRECT_URI: str = "http://localhost:8001/api/platform-connections/google/callback"
+    GOOGLE_ADS_OAUTH_REDIRECT_URI: str = "/api/platform-connections/google/callback"
 
     # ElevenLabs
     ELEVENLABS_API_KEY: str | None = None
@@ -117,15 +171,12 @@ class Settings(BaseSettings):
     # Silence duration (ms) after which end-of-speech is triggered
     FUSION_VAD_SILENCE_MS: int = 700
 
-    # Public-facing base URL — used to register post-call webhook with ElevenLabs.
-    # Example: https://api.yourdomain.com  (no trailing slash)
-    APP_PUBLIC_URL: str | None = None
-
-    # Backend public URL — used to prefix /outputs/ media URLs so they resolve
-    # across origins (e.g. Azure Static Web App → Container App).
-    # Leave blank on AWS where CloudFront/nginx proxies everything through one origin.
-    # Example: https://marketingai-backend.wonderfulpond-9e50895b.eastus2.azurecontainerapps.io
-    BACKEND_PUBLIC_URL: str | None = None
+    # Backend base URL — joined with relative paths (OAuth callbacks, media URLs,
+    # WS URLs, generated-page API_BASE) to build absolute URLs in split-origin
+    # deployments (e.g. Azure Static Web App → Container App).
+    # Leave blank for single-origin dev/AWS where relative URLs suffice.
+    # Example: https://backend.example.com  (no trailing slash)
+    BACKEND_HOSTING_URL: str = ""
 
     # Frontend origins allowed to call the API with cookies (comma-separated).
     # Required for cookie auth — browsers reject allow_credentials with "*".

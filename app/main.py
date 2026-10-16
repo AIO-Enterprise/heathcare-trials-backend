@@ -11,10 +11,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.api.routes.account import auth, company, users
-from app.api.routes.assets import brand_kit, documents, onboarding
+from app.api.routes.assets import brand_kit, documents, files, onboarding
 from app.api.routes.campaigns.advertisements import routers as _ad_routers
 from app.api.routes.engagement import bookings, chat, sms, survey_responses
 from app.api.routes.engagement.hybrid_voice_session import router as hybrid_voice_router
@@ -79,8 +79,8 @@ def _validate_secret_key() -> None:
 
 def _validate_public_urls() -> None:
     """Refuse to boot production without absolute-URL config — relative media links would 404 cross-origin."""
-    if settings.APP_ENV == "prod" and not (settings.BACKEND_PUBLIC_URL or "").rstrip("/"):
-        raise RuntimeError("BACKEND_PUBLIC_URL is required when APP_ENV=prod (used for absolute media/WS/website URLs)")
+    if settings.APP_ENV == "prod" and not settings.backend_base:
+        raise RuntimeError("BACKEND_HOSTING_URL is required when APP_ENV=prod (used for absolute media/WS/website URLs)")
 
 
 def _supervised(factory):
@@ -113,9 +113,14 @@ async def _security_headers(request: Request, call_next):
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     # Hosted landing pages, the website preview, and document file endpoints
     # may be framed (PDF/text preview in an <iframe>) — skip X-Frame-Options.
+    # Landing-page HTML served via /api/files/.../index.html must be frameable
+    # too, otherwise the in-app preview iframe stays blank despite a 200.
+    # Images/video/pdf are unaffected by framing policy — but keep the
+    # allowlist tight anyway: only .html/.htm under /api/files.
     _path = request.url.path
     _frameable = (
         _path.endswith("/website") or _path.endswith("/file")  # /{ad_id}/documents/{doc_id}/file and company doc files
+        or (_path.startswith("/api/files/") and _path.endswith((".html", ".htm")))
     )
     if not _frameable:
         response.headers["X-Frame-Options"] = "DENY"
@@ -142,8 +147,8 @@ async def lifespan(app: FastAPI):
         os.makedirs(os.path.join(settings.UPLOAD_DIR, "docs"), exist_ok=True)
         os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
     logger.info("STORAGE_BACKEND = %r", settings.STORAGE_BACKEND or "local")
-    logger.info("BACKEND_PUBLIC_URL = %r", settings.BACKEND_PUBLIC_URL)
-    logger.info("META_OAUTH_REDIRECT_URI = %r", settings.META_OAUTH_REDIRECT_URI)
+    logger.info("BACKEND_HOSTING_URL = %r", settings.BACKEND_HOSTING_URL)
+    logger.info("META_OAUTH_REDIRECT_URI = %r", settings.meta_redirect_uri)
 
     from app.services.ads.meta_stale_sweeper import run_stale_generating_sweeper
 
@@ -241,6 +246,21 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(onboarding.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(documents.router, prefix="/api")
+app.include_router(files.router, prefix="/api")
+
+
+# Raw stored paths ("/outputs/...", "/uploads/...") appear in DB rows and API
+# payloads. They have no open mount by design — redirect same-origin callers
+# to the auth-checked files route (307 keeps the method; the browser replays
+# cookies on the follow-up, so anonymous hits still 401 there).
+@app.get("/outputs/{file_path:path}", include_in_schema=False)
+async def _outputs_compat(file_path: str):
+    return RedirectResponse(url=f"/api/files/outputs/{file_path}", status_code=307)
+
+
+@app.get("/uploads/{file_path:path}", include_in_schema=False)
+async def _uploads_compat(file_path: str):
+    return RedirectResponse(url=f"/api/files/uploads/{file_path}", status_code=307)
 for _r in _ad_routers:
     app.include_router(_r, prefix="/api")
 app.include_router(analytics.router, prefix="/api")

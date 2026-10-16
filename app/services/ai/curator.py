@@ -14,7 +14,6 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.llm import extract_json, get_ai_client
 from app.models.models import Advertisement, CompanyDocument, DocumentType
 from app.services.ai.skills import load_skill
@@ -26,8 +25,8 @@ class CuratorService:
     def __init__(self, db: AsyncSession, company_id: str, ai=None):
         self.db = db
         self.company_id = company_id
-        # Injectable AI client (DIP) — defaults to the shared provider adapter.
-        self.ai = ai or get_ai_client()
+        # Injectable AI client (DIP) — defaults to the shared curator-slot adapter.
+        self.ai = ai or get_ai_client("curator")
 
     async def generate_strategy(
         self,
@@ -140,8 +139,6 @@ Respond ONLY with the JSON object, no additional text.
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
             max_tokens=4096,
-            # Strategy generation always uses the Opus-tier model.
-            model=settings.BEDROCK_CURATOR_MODEL if settings.USE_BEDROCK else settings.ANTHROPIC_CURATOR_MODEL,
         )
 
         try:
@@ -188,7 +185,9 @@ Protocol Documents: {doc_titles}
 
 {doc_block}{strategy_summary}
 
-Generate 6–8 multiple-choice questions that screen or assess respondents for eligibility, suitability, or relevant experience for this campaign. Each question must have exactly 4 answer options. Questions should be specific to the campaign context — not generic.
+Generate 5–7 multiple-choice questions that screen or assess respondents for eligibility, suitability, or relevant experience for this campaign. Each question must have exactly 4 answer options. Questions should be specific to the campaign context — not generic.
+
+Use data minimization. Only ask for information that is genuinely needed for early screening at this stage. Prefer lightweight qualification questions first. Avoid collecting unnecessary sensitive medical detail, detailed medication history, or consent-process questions unless the campaign context clearly requires them for initial screening.
 
 For each question you MUST include a "correct_option" field: the 0-based index (0–3) of the answer that indicates the respondent IS eligible or suitable. This is the answer that passes the screening criterion for that question.
 
@@ -207,7 +206,7 @@ Return ONLY a JSON object in this exact format:
 }}"""
 
         text = await self.ai.complete(
-            system="You are an expert at creating screening questionnaires for campaigns. Always respond with valid JSON only. Always include correct_option (0-based index of the eligibility-passing answer) for every question.",
+            system="You are an expert at creating screening questionnaires for campaigns. Always respond with valid JSON only. Always include correct_option (0-based index of the eligibility-passing answer) for every question. Minimize sensitive-data collection and ask only what is necessary for initial screening.",
             messages=[{"role": "user", "content": user_message}],
             max_tokens=2048,
         )
@@ -264,6 +263,75 @@ Return ONLY the updated question JSON object (no array, no extra text):
             return updated
         except json.JSONDecodeError:
             return question
+
+    async def rewrite_questionnaire(
+        self,
+        advertisement: Advertisement,
+        docs: list,
+        instruction: str,
+    ) -> dict[str, Any]:
+        """Regenerate the full questionnaire with reviewer/ethics instructions."""
+        logger.info("Rewriting questionnaire for ad=%s", advertisement.id)
+        if not self.ai.is_configured():
+            return self._mock_questionnaire(advertisement.title)
+
+        doc_titles = ", ".join(d.title for d in docs if d.priority > 0) or "none"
+        strategy_summary = ""
+        if advertisement.strategy_json:
+            es = advertisement.strategy_json.get("executive_summary", "")
+            if es:
+                strategy_summary = f"\nCampaign Strategy Summary: {es[:400]}"
+
+        current_questionnaire = json.dumps(advertisement.questionnaire or {"questions": []}, indent=2)
+        doc_contents = []
+        for d in docs:
+            if d.priority > 0:
+                content = getattr(d, "content", None) or ""
+                if content:
+                    doc_contents.append(f"[{d.title}]: {content[:600]}")
+        doc_block = "\n".join(doc_contents) if doc_contents else "No protocol documents provided."
+
+        user_message = f"""You are rewriting the full screening/eligibility questionnaire for this campaign.
+
+Campaign Title: {advertisement.title}
+Ad Types: {", ".join(advertisement.ad_type)}
+Protocol Documents: {doc_titles}
+
+{doc_block}{strategy_summary}
+
+Current questionnaire:
+{current_questionnaire}
+
+Reviewer instruction:
+{instruction}
+
+Regenerate the questionnaire so it follows the instruction while remaining suitable for early-stage screening.
+Generate 5–7 multiple-choice questions, each with exactly 4 answer options.
+Use data minimization. Ask only what is necessary for initial screening.
+Return ONLY a JSON object in this exact format:
+{{
+  "questions": [
+    {{
+      "id": "q1",
+      "text": "Question text here?",
+      "type": "multiple_choice",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correct_option": 0,
+      "required": true
+    }}
+  ]
+}}"""
+
+        text = await self.ai.complete(
+            system="You rewrite screening questionnaires. Always respond with valid JSON only. Minimize sensitive-data collection and ask only what is necessary for initial screening.",
+            messages=[{"role": "user", "content": user_message}],
+            max_tokens=2048,
+        )
+        try:
+            return extract_json(text)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse rewritten questionnaire JSON for ad=%s", advertisement.id)
+            return {"questions": [], "parse_error": True}
 
     def _mock_questionnaire(self, title: str) -> dict[str, Any]:
         """Dev mock questionnaire when no API key is configured."""

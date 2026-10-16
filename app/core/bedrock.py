@@ -1,24 +1,35 @@
 """
-Bedrock client factory.
-Returns the right sync or async Anthropic client based on USE_BEDROCK config.
+Bedrock client factory — per-slot models from 1.env (AWS_{SLOT}_MODEL).
 
-Usage (async services — curator, reviewer, optimizer, reinforcement):
+Strict per-slot fallback lives in app.core.llm: an AZURE_{SLOT}_* triplet
+set → Azure; else the AWS_{SLOT}_MODEL here. No cross-slot inheritance.
+
+Usage (async services):
     from app.core.bedrock import get_async_client, get_model
     client   = get_async_client()
-    response = await client.messages.create(model=get_model(), ...)
+    response = await client.messages.create(model=get_model("curator"), ...)
 
 Usage (sync services — trainer):
     from app.core.bedrock import get_client, get_model
     client   = get_client()
-    response = client.messages.create(model=get_model(), ...)
+    response = client.messages.create(model=get_model("generic"), ...)
 """
 
 from app.core.config import settings
 
+_VALID_SLOTS = ("generic", "curator", "chat")
 
-def is_configured() -> bool:
-    """True if any AI backend is configured."""
-    return settings.USE_BEDROCK or bool(settings.ANTHROPIC_API_KEY)
+
+def _check_slot(slot: str) -> str:
+    slot = (slot or "generic").lower()
+    if slot not in _VALID_SLOTS:
+        raise ValueError(f"unknown LLM slot {slot!r} (expected one of {_VALID_SLOTS})")
+    return slot
+
+
+def is_configured(slot: str = "generic") -> bool:
+    """True when this slot has a Bedrock model (creds optional — boto chain/IAM role)."""
+    return bool(get_model(slot))
 
 
 def _bedrock_kwargs() -> dict:
@@ -28,11 +39,11 @@ def _bedrock_kwargs() -> dict:
     them via its default chain (IAM role, ~/.aws/credentials, Secrets Manager
     sidecar, ECS task role, instance metadata, etc.).
     """
-    kwargs = {"aws_region": settings.AWS_REGION}
-    if settings.AWS_ACCESS_KEY_ID:
-        kwargs["aws_access_key"] = settings.AWS_ACCESS_KEY_ID
-    if settings.AWS_SECRET_ACCESS_KEY:
-        kwargs["aws_secret_key"] = settings.AWS_SECRET_ACCESS_KEY
+    kwargs = {"aws_region": settings.AWS_REGION or "us-east-1"}
+    if settings.AWS_ACCESS_KEY_ID and settings.AWS_ACCESS_KEY_ID.strip():
+        kwargs["aws_access_key"] = settings.AWS_ACCESS_KEY_ID.strip()
+    if settings.AWS_SECRET_ACCESS_KEY and settings.AWS_SECRET_ACCESS_KEY.strip():
+        kwargs["aws_secret_key"] = settings.AWS_SECRET_ACCESS_KEY.strip()
     return kwargs
 
 
@@ -43,50 +54,43 @@ _async_client = None
 
 
 def get_client():
-    """Synchronous client — use in blocking/trainer contexts."""
+    """Synchronous Bedrock client — use in blocking/trainer contexts."""
     global _sync_client
     if _sync_client is None:
-        if settings.USE_BEDROCK:
-            from anthropic import AnthropicBedrock
+        from anthropic import AnthropicBedrock
 
-            _sync_client = AnthropicBedrock(**_bedrock_kwargs())
-        else:
-            from anthropic import Anthropic
-
-            _sync_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        _sync_client = AnthropicBedrock(**_bedrock_kwargs())
     return _sync_client
 
 
 def get_async_client():
-    """Async client — use in async service methods."""
+    """Async Bedrock client — use in async service methods."""
     global _async_client
     if _async_client is None:
-        if settings.USE_BEDROCK:
-            from anthropic import AsyncAnthropicBedrock
+        from anthropic import AsyncAnthropicBedrock
 
-            _async_client = AsyncAnthropicBedrock(**_bedrock_kwargs())
-        else:
-            from anthropic import AsyncAnthropic
-
-            _async_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+        _async_client = AsyncAnthropicBedrock(**_bedrock_kwargs())
     return _async_client
 
 
 async def close_clients() -> None:
-    """Close cached clients on shutdown (no-op if never created)."""
+    """Close cached Bedrock clients on shutdown (no-op if never created)."""
     global _async_client
     if _async_client is not None:
         try:
             await _async_client.close()
         finally:
             _async_client = None
+    from app.core.llm import close_azure_clients
+
+    await close_azure_clients()
 
 
-def get_model() -> str:
-    """Return the correct model ID for the active backend."""
-    return settings.BEDROCK_MODEL if settings.USE_BEDROCK else settings.ANTHROPIC_MODEL
+def get_model(slot: str = "generic") -> str:
+    """Return the Bedrock model ID for a slot ("" when unset)."""
+    return settings.bedrock_model(_check_slot(slot))
 
 
 def get_curator_model() -> str:
-    """Return Opus 4.6 model ID — used exclusively for ad strategy generation."""
-    return settings.BEDROCK_CURATOR_MODEL if settings.USE_BEDROCK else settings.ANTHROPIC_CURATOR_MODEL
+    """Return the curator-tier Bedrock model ID."""
+    return get_model("curator")

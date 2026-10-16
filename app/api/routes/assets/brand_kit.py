@@ -165,14 +165,16 @@ async def upload_brand_pdf(
 
 
 @router.post("/brand-kit/extract-pdf")
-async def extract_brand_from_pdf(
-    file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
-):
+async def extract_brand_from_pdf(file: UploadFile = File(...)):
     """
     Upload a brand guidelines PDF and extract color/font/tone signals from it.
-    Uses pymupdf to read vector colors and font names, then Claude to interpret
-    them into clean hex values and Google Font names.
+    Uses pymupdf to read vector colors and font names, then the generic LLM
+    slot to interpret them into clean hex values and Google Font names.
+
+    Public (no auth): the onboarding brand step calls this before the company
+    registers, so no user/company exists yet to scope to. It is stateless —
+    returns the extracted brand fields as JSON, saves nothing. Abuse is
+    bounded by the rate-limit bucket plus the file-size cap below.
 
     Returns the extracted brand fields as JSON — does NOT save to the database.
     The client should review and then call POST/PATCH /brand-kit/ to persist.
@@ -186,6 +188,8 @@ async def extract_brand_from_pdf(
     pdf_bytes = await file.read()
     if len(pdf_bytes) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(pdf_bytes) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="PDF exceeds the 12 MB limit.")
 
     try:
         from app.services.storage.brand_kit_extractor import extract_brand_from_pdf

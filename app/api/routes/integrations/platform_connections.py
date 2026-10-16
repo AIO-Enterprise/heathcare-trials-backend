@@ -113,7 +113,7 @@ async def get_meta_oauth_url(
     url = (
         f"https://www.facebook.com/v21.0/dialog/oauth"
         f"?client_id={settings.META_APP_ID}"
-        f"&redirect_uri={quote(settings.META_OAUTH_REDIRECT_URI, safe='')}"
+        f"&redirect_uri={quote(settings.meta_redirect_uri, safe='')}"
         f"&scope={scopes}"
         f"&state={state}"
         f"&response_type=code"
@@ -162,7 +162,7 @@ async def meta_oauth_callback(
             code=code,
             app_id=settings.META_APP_ID,
             app_secret=settings.META_APP_SECRET,
-            redirect_uri=settings.META_OAUTH_REDIRECT_URI,
+            redirect_uri=settings.meta_redirect_uri,
         )
 
         # Step 2: short-lived → long-lived (~60 days, auto-renews on active use)
@@ -384,7 +384,7 @@ async def get_google_oauth_url(
 
     url = GoogleAdsService.build_oauth_url(
         client_id=settings.GOOGLE_ADS_CLIENT_ID,
-        redirect_uri=settings.GOOGLE_ADS_OAUTH_REDIRECT_URI,
+        redirect_uri=settings.google_redirect_uri,
         state=state,
     )
     return {"url": url}
@@ -432,7 +432,7 @@ async def google_oauth_callback(
             code=code,
             client_id=settings.GOOGLE_ADS_CLIENT_ID,
             client_secret=settings.GOOGLE_ADS_CLIENT_SECRET,
-            redirect_uri=settings.GOOGLE_ADS_OAUTH_REDIRECT_URI,
+            redirect_uri=settings.google_redirect_uri,
         )
 
         # Upsert: one connection per company per platform

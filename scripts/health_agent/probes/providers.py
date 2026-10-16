@@ -16,10 +16,12 @@ from .base import ProbeResult, SkipProbe, run_probe
 def _bedrock():
     probe = BACKEND_DIR / "test_bedrock.py"
     if not probe.exists():
+        probe = REPO_ROOT / "test_bedrock.py"  # backend IS the repo root here
+    if not probe.exists():
         raise SkipProbe("test_bedrock.py not present")
     out = subprocess.run(
         [sys.executable, str(probe)],
-        cwd=BACKEND_DIR,
+        cwd=str(probe.parent),
         capture_output=True,
         text=True,
         timeout=60,
@@ -31,17 +33,24 @@ def _bedrock():
 
 
 def _openai():
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise SkipProbe("OPENAI_API_KEY not set")
-    r = requests.get(
-        "https://api.openai.com/v1/models",
-        headers={"Authorization": f"Bearer {key}"},
-        timeout=PROBE_TIMEOUT,
+    """Minimal live Foundry check — this resource exposes no models-list endpoint."""
+    url = (os.getenv("AZURE_GENERIC_API_URL") or "").strip()
+    key = (os.getenv("AZURE_GENERIC_API_KEY") or "").strip()
+    model = (os.getenv("AZURE_GENERIC_MODEL") or "").strip()
+    if not (url and key and model):
+        raise SkipProbe("AZURE_GENERIC_API_URL / AZURE_GENERIC_API_KEY / AZURE_GENERIC_MODEL not set")
+    from openai import OpenAI
+
+    base = url[: url.index("/openai/v1") + len("/openai/v1")] if "/openai/v1" in url else url.rstrip("/") + "/openai/v1"
+    r = OpenAI(base_url=base, api_key=key).responses.create(
+        model=model,
+        input="Reply with exactly: probe-ok",
+        max_output_tokens=32,  # this deployment rejects values < 16
     )
-    r.raise_for_status()
-    n = len(r.json().get("data", []))
-    return f"{n} models listed"
+    text = (r.output_text or "").strip()
+    if "probe-ok" not in text:
+        raise RuntimeError(f"unexpected reply: {text[:80]}")
+    return f"reply: {text[:30]}"
 
 
 def _elevenlabs():
@@ -59,10 +68,10 @@ def _elevenlabs():
 
 
 def _google_ads_oauth():
-    cid = os.getenv("GOOGLE_CLIENT_ID")
-    csec = os.getenv("GOOGLE_CLIENT_SECRET")
+    cid = os.getenv("GOOGLE_CLIENT_ID") or os.getenv("GOOGLE_ADS_CLIENT_ID")
+    csec = os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("GOOGLE_ADS_CLIENT_SECRET")
     if not cid or not csec:
-        raise SkipProbe("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set")
+        raise SkipProbe("GOOGLE_ADS_CLIENT_ID / GOOGLE_ADS_CLIENT_SECRET not set")
     r = requests.post(
         "https://oauth2.googleapis.com/tokeninfo",
         params={"client_id": cid},

@@ -51,6 +51,7 @@ from app.schemas.review import (  # noqa: F401
     MinorEditRequest,
     ReviewCreate,
     ReviewOut,
+    RewriteContentRequest,
     RewriteQuestionRequest,
     RewriteStrategyRequest,
 )

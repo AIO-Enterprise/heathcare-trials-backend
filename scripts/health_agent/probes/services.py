@@ -64,14 +64,14 @@ def _bedrock_client_call():
     _ensure_backend_path()
     from app.core.bedrock import get_async_client, get_model, is_configured
 
-    if not is_configured():
-        raise SkipProbe("USE_BEDROCK=false or AWS creds missing")
+    if not is_configured("generic"):
+        raise SkipProbe("AWS_GENERIC_MODEL not set")
     import asyncio
 
     async def _go():
         client = get_async_client()
         resp = await client.messages.create(
-            model=get_model(),
+            model=get_model("generic"),
             max_tokens=16,
             messages=[{"role": "user", "content": "Reply: OK"}],
         )

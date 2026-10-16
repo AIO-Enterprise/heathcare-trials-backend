@@ -20,6 +20,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # --reload: bind-mounted code restarts the worker on save (dev only —
+    # the Dockerfile CMD stays reload-free for production images).
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--reload"]
     ports:
       - "8000:8000"
     env_file: .env

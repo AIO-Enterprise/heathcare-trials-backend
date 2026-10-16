@@ -6,26 +6,21 @@ import time
 
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-use_bedrock = os.getenv("USE_BEDROCK", "false").lower() == "true"
 aws_key = os.getenv("AWS_ACCESS_KEY_ID")
 aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
 aws_region = os.getenv("AWS_REGION", "us-east-1")
-bedrock_model = os.getenv("BEDROCK_MODEL", "anthropic.claude-sonnet-4-6")
+bedrock_model = os.getenv("AWS_GENERIC_MODEL", "")
 
-print(f"USE_BEDROCK  : {use_bedrock}")
-print(f"AWS_REGION   : {aws_region}")
-print(f"BEDROCK_MODEL: {bedrock_model}")
-print(f"KEY present  : {'yes' if aws_key else 'NO — missing'}")
+print(f"AWS_REGION        : {aws_region}")
+print(f"AWS_GENERIC_MODEL : {bedrock_model or 'NOT SET'}")
+print(f"KEY present       : {'yes' if aws_key else 'NO — missing (boto chain/IAM role may still work)'})")
 print()
 
-if not use_bedrock:
-    print("USE_BEDROCK is false — nothing to test.")
+if not bedrock_model:
+    print("AWS_GENERIC_MODEL is empty — nothing to test.")
     sys.exit(0)
-if not aws_key or not aws_secret:
-    print("AWS credentials missing in .env")
-    sys.exit(1)
 
 try:
     from anthropic import AnthropicBedrock
@@ -34,11 +29,12 @@ except ImportError:
     sys.exit(1)
 
 print("Connecting to Bedrock …")
-client = AnthropicBedrock(
-    aws_access_key=aws_key,
-    aws_secret_key=aws_secret,
-    aws_region=aws_region,
-)
+kwargs = {"aws_region": aws_region}
+if aws_key:
+    kwargs["aws_access_key"] = aws_key
+if aws_secret:
+    kwargs["aws_secret_key"] = aws_secret
+client = AnthropicBedrock(**kwargs)
 
 for attempt in range(3):
     try:

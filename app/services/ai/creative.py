@@ -3,8 +3,8 @@ Creative Agent - Ad Copy + Image Generation
 Owner: AI Dev
 
 Pipeline:
-  1. Claude Sonnet  → structured JSON (layout specs + copy + photo prompt)
-  2. GPT-image-1    → clean background photo (scene only, no text)
+  1. Generic LLM   → structured JSON (layout specs + copy + photo prompt)
+  2. Image model   → clean background photo (scene only, no text)
   3. Compositor     → Pillow overlays headline, divider, subtext onto photo
   4. Save PNG       → served via /outputs/
 """
@@ -16,7 +16,7 @@ import logging
 import os
 from typing import Any
 
-from openai import AzureOpenAI, OpenAI
+from openai import OpenAI
 
 from app.core.config import settings
 from app.core.llm import extract_json, get_ai_client
@@ -26,35 +26,45 @@ from app.models.models import Advertisement
 logger = logging.getLogger(__name__)
 
 
-def _get_image_client():
-    """Returns AzureOpenAI if Azure Foundry vars are set, else standard OpenAI."""
-    if settings.AZURE_OPENAI_ENDPOINT and settings.AZURE_OPENAI_API_KEY:
-        from urllib.parse import urlparse
+def _foundry_base_url(url: str) -> str:
+    """Root for the Foundry OpenAI v1 data plane (".../openai/v1")."""
+    from urllib.parse import urlparse
 
-        parsed = urlparse(settings.AZURE_OPENAI_ENDPOINT)
-        base_url = f"{parsed.scheme}://{parsed.netloc}/"
-        return AzureOpenAI(
-            azure_endpoint=base_url,
-            api_key=settings.AZURE_OPENAI_API_KEY,
-            api_version=settings.AZURE_OPENAI_API_VERSION,
-        )
-    return OpenAI(api_key=settings.OPENAI_API_KEY)
+    url = (url or "").strip()
+    parsed = urlparse(url)
+    root = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else url.rstrip("/")
+    path = parsed.path or ""
+    if "/openai/v1" in path:
+        return root + path[: path.index("/openai/v1") + len("/openai/v1")]
+    return root + "/openai/v1"
+
+
+def _get_image_client():
+    """Returns an OpenAI-compatible image client, or None when AZURE_IMAGE_GEN_* is unset."""
+    url = (settings.AZURE_IMAGE_GEN_API_URL or "").strip()
+    key = (settings.AZURE_IMAGE_GEN_API_KEY or "").strip()
+    if not (url and key):
+        return None
+    return OpenAI(base_url=_foundry_base_url(url), api_key=key)
 
 
 def _image_generation_enabled() -> bool:
-    enabled = bool((settings.AZURE_OPENAI_ENDPOINT and settings.AZURE_OPENAI_API_KEY) or settings.OPENAI_API_KEY)
+    enabled = bool(
+        (settings.AZURE_IMAGE_GEN_API_URL or "").strip()
+        and (settings.AZURE_IMAGE_GEN_API_KEY or "").strip()
+        and (settings.AZURE_IMAGE_GEN_MODEL or "").strip()
+    )
     import logging
 
     _log = logging.getLogger(__name__)
     # Partial endpoint — safe to log (no credentials)
-    endpoint_hint = (settings.AZURE_OPENAI_ENDPOINT or "")[:60] if settings.AZURE_OPENAI_ENDPOINT else "not set"
+    endpoint_hint = (settings.AZURE_IMAGE_GEN_API_URL or "")[:60] if settings.AZURE_IMAGE_GEN_API_URL else "not set"
     _log.info(
-        "Image generation enabled=%s | model=%s | azure_endpoint=%s | has_azure_key=%s | has_openai_key=%s",
+        "Image generation enabled=%s | model=%s | azure_endpoint=%s | has_azure_key=%s",
         enabled,
-        settings.OPENAI_IMAGE_MODEL,
+        (settings.AZURE_IMAGE_GEN_MODEL or "").strip() or "not set",
         endpoint_hint,
-        bool(settings.AZURE_OPENAI_API_KEY),
-        bool(settings.OPENAI_API_KEY),
+        bool((settings.AZURE_IMAGE_GEN_API_KEY or "").strip()),
     )
     return enabled
 
@@ -141,8 +151,15 @@ Choose the CTA that matches the hook's tone and lowers friction:
   Urgency:      "Check My Eligibility" | "See If I Qualify" | "Start Tonight"
   Low-friction: "Take the 60-Second Quiz" | "Check in 60 Seconds"
   Reward:       "Claim My Spot" | "Get Paid to Participate"
-  Mission:      "Join the Study" | "Help Advance Research"
+  Mission:      "Learn About the Study" | "Contact the Study Team" | "Help Advance Research"
   Default:      "Book Now"
+
+CRITICAL SAFETY RULES FOR COPY:
+  - Do NOT imply the advertiser knows the viewer's medical condition or diagnosis.
+  - Avoid stereotype-heavy condition shortcuts like "Still reading EVERY LABEL before lunch?" unless the strategy explicitly supports that phrasing and it can be framed neutrally.
+  - Do NOT use scarcity or pressure language such as "limited spots", "act now", or similar urgency unless the campaign context explicitly requires it and it is factual, material, and non-misleading.
+  - Any statistic used in headline_text, body, or proof_line must be source-safe, geographically sensible, and easy for the sponsor to substantiate. If unsure, do not use a statistic.
+  - If the campaign's next step is inquiry, information request, or eligibility screening, the CTA must reflect that. Do NOT use enrollment-forward CTAs like "Join the Study" unless the next step is truly enrollment.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 LAYOUT RULES (full_bleed only)
@@ -226,13 +243,13 @@ class CreativeService:
         # Injectable AI client (DIP) — defaults to the shared provider adapter.
         self.ai = ai or get_ai_client()
 
-    async def generate_creatives(self, ad: Advertisement) -> list[dict[str, Any]]:
+    async def generate_creatives(self, ad: Advertisement, instructions: str | None = None) -> list[dict[str, Any]]:
         """
         Main entry point.
         Returns list of creative dicts: {format, headline, body, cta, layout, image_prompt, image_url}
         """
         # Step 1: Claude → structured JSON (layout + photo prompt)
-        brief = await self._generate_brief(ad)
+        brief = await self._generate_brief(ad, instructions=instructions)
         items = brief.get("creatives", [])
         if not items:
             return []
@@ -287,7 +304,7 @@ class CreativeService:
 
     # ── Step 1: Claude brief ──────────────────────────────────────────────────
 
-    async def _generate_brief(self, ad: Advertisement) -> dict[str, Any]:
+    async def _generate_brief(self, ad: Advertisement, instructions: str | None = None) -> dict[str, Any]:
         if not self.ai.is_configured():
             return self._mock_brief(ad)
 
@@ -305,6 +322,9 @@ Budget: {ad.budget or "unspecified"}
 
 Generate one creative brief per format listed in the ad specifications.
 If no formats are defined, generate three 1080x1920 Meta Story Ads — each a distinct creative with different hook, mood, and photo concept."""
+
+        if instructions and instructions.strip():
+            user_msg += f"\n\n## Reviewer / Ethics Instruction\n{instructions.strip()}\n\nApply this instruction precisely while keeping the creatives compliant and production-ready."
 
         try:
             text = await self.ai.complete(
@@ -350,6 +370,9 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
         # Step 2: GPT-image-1 → raw scene photo
         try:
             client = _get_image_client()
+            if client is None:
+                log.error("Image generation not configured (AZURE_IMAGE_GEN_*) [format=%s, ad=%s]", format_name, ad_id)
+                return None
             size = self._get_openai_size(format_name)
 
             safe_prompt = (
@@ -358,7 +381,7 @@ If no formats are defined, generate three 1080x1920 Meta Story Ads — each a di
             )[:400]
 
             response = client.images.generate(
-                model=settings.OPENAI_IMAGE_MODEL,
+                model=(settings.AZURE_IMAGE_GEN_MODEL or "").strip(),
                 prompt=safe_prompt,
                 size=size,
                 quality="high",

@@ -31,6 +31,7 @@ from app.models.models import (
 from app.schemas.schemas import (
     AdvertisementOut,
     QuestionnaireUpdate,
+    RewriteContentRequest,
     RewriteQuestionRequest,
     RewriteStrategyRequest,
 )
@@ -333,6 +334,84 @@ async def _bg_rewrite_strategy(
                     await db2.commit()
         except Exception:
             logger.exception("Failed to persist generation error state for ad %s", ad_id)
+
+
+async def _bg_rewrite_questionnaire(
+    ad_id: str,
+    company_id: str,
+    reviewer_id: str,
+    instructions: str,
+    restore_status: AdStatus,
+) -> None:
+    from app.db.database import async_session_factory
+
+    try:
+        async with async_session_factory() as db:
+            result = await db.execute(select(Advertisement).where(Advertisement.id == ad_id))
+            ad = result.scalar_one_or_none()
+            if not ad:
+                return
+
+            all_docs = await _load_all_docs(db, ad_id, company_id)
+            curator = CuratorService(db, company_id)
+            questionnaire = await curator.rewrite_questionnaire(ad, all_docs, instructions)
+            ad.questionnaire = questionnaire
+            flag_modified(ad, "questionnaire")
+
+            preview = instructions[:120] + ("…" if len(instructions) > 120 else "")
+            db.add(
+                Review(
+                    advertisement_id=ad_id,
+                    reviewer_id=reviewer_id,
+                    review_type="system",
+                    status="pending",
+                    comments=f"AI Re-Questionnaire completed: '{preview}'",
+                )
+            )
+
+            ad.status = restore_status
+            await db.commit()
+    except Exception as e:
+        logger.error("Background rewrite-questionnaire failed for ad %s: %s", ad_id, e, exc_info=True)
+
+
+async def _bg_rewrite_creatives(
+    ad_id: str,
+    company_id: str,
+    reviewer_id: str,
+    instructions: str,
+    restore_status: AdStatus,
+) -> None:
+    from app.db.database import async_session_factory
+    from app.services.ai.creative import CreativeService
+
+    try:
+        async with async_session_factory() as db:
+            result = await db.execute(select(Advertisement).where(Advertisement.id == ad_id))
+            ad = result.scalar_one_or_none()
+            if not ad:
+                return
+
+            svc = CreativeService(company_id)
+            creatives = await svc.generate_creatives(ad, instructions=instructions)
+            ad.output_files = creatives
+            flag_modified(ad, "output_files")
+
+            preview = instructions[:120] + ("…" if len(instructions) > 120 else "")
+            db.add(
+                Review(
+                    advertisement_id=ad_id,
+                    reviewer_id=reviewer_id,
+                    review_type="system",
+                    status="pending",
+                    comments=f"AI Re-Creatives completed: '{preview}'",
+                )
+            )
+
+            ad.status = restore_status
+            await db.commit()
+    except Exception as e:
+        logger.error("Background rewrite-creatives failed for ad %s: %s", ad_id, e, exc_info=True)
 
 
 # ── Questionnaire ─────────────────────────────────────────────────────────────
@@ -689,13 +768,91 @@ async def rewrite_strategy(
             detail=f"Strategy can only be rewritten from STRATEGY_CREATED, UNDER_REVIEW, or ETHICS_REVIEW, not '{ad.status.value}'",
         )
 
+    restore_status = ad.status
+    ad.status = AdStatus.OPTIMIZING
+    await db.flush()
+
     background_tasks.add_task(
         _bg_rewrite_strategy,
         ad_id,
         user.company_id,
         user.id,
         body.instructions,
-        ad.status,
+        restore_status,
+    )
+    return ad
+
+
+@router.post("/{ad_id}/rewrite-questionnaire", response_model=AdvertisementOut)
+async def rewrite_questionnaire(
+    ad_id: str,
+    body: RewriteContentRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(require_roles([UserRole.PROJECT_MANAGER, UserRole.ETHICS_MANAGER])),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Advertisement).where(
+            Advertisement.id == ad_id,
+            Advertisement.company_id == user.company_id,
+        )
+    )
+    ad = result.scalar_one_or_none()
+    if not ad:
+        raise HTTPException(status_code=404, detail="Advertisement not found")
+
+    _rewritable = (AdStatus.STRATEGY_CREATED, AdStatus.UNDER_REVIEW, AdStatus.ETHICS_REVIEW)
+    if ad.status not in _rewritable:
+        raise HTTPException(status_code=400, detail="Questionnaire cannot be recreated from the current status.")
+
+    restore_status = ad.status
+    ad.status = AdStatus.OPTIMIZING
+    await db.flush()
+
+    background_tasks.add_task(
+        _bg_rewrite_questionnaire,
+        ad_id,
+        user.company_id,
+        user.id,
+        body.instructions,
+        restore_status,
+    )
+    return ad
+
+
+@router.post("/{ad_id}/rewrite-creatives", response_model=AdvertisementOut)
+async def rewrite_creatives(
+    ad_id: str,
+    body: RewriteContentRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(require_roles([UserRole.PROJECT_MANAGER, UserRole.ETHICS_MANAGER])),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Advertisement).where(
+            Advertisement.id == ad_id,
+            Advertisement.company_id == user.company_id,
+        )
+    )
+    ad = result.scalar_one_or_none()
+    if not ad:
+        raise HTTPException(status_code=404, detail="Advertisement not found")
+
+    _rewritable = (AdStatus.STRATEGY_CREATED, AdStatus.UNDER_REVIEW, AdStatus.ETHICS_REVIEW)
+    if ad.status not in _rewritable:
+        raise HTTPException(status_code=400, detail="Creatives cannot be recreated from the current status.")
+
+    restore_status = ad.status
+    ad.status = AdStatus.OPTIMIZING
+    await db.flush()
+
+    background_tasks.add_task(
+        _bg_rewrite_creatives,
+        ad_id,
+        user.company_id,
+        user.id,
+        body.instructions,
+        restore_status,
     )
     return ad
 
@@ -797,3 +954,4 @@ Return ONLY valid JSON, no markdown or explanation."""
         }
 
     return {"ad_id": ad_id, "suggestions": suggestions}
+

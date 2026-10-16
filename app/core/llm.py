@@ -1,15 +1,19 @@
 """
 Provider-agnostic LLM access layer.
 
+Slots mirror 1.env: "generic" (reviewer/optimizer/creative brief/...),
+"curator" (strategy), "chat" (widget). Strict per-slot fallback:
+AZURE_{SLOT}_* triplet set → Azure Foundry (GPT); else AWS_{SLOT}_MODEL
+(Bedrock Claude). No cross-slot inheritance — leave a slot's Azure triplet
+empty and that slot runs on Bedrock.
+
 Services depend on the AIClient interface (constructor-injected in tests,
-module default in production) instead of building Anthropic SDK clients
-inline. Swapping providers means writing one new adapter — not editing every
-call site.
+module default in production) instead of building SDK clients inline:
 
 Usage:
     from app.core.llm import get_ai_client
 
-    client = get_ai_client()
+    client = get_ai_client("curator")
     text   = await client.complete(system=system_prompt, messages=[...], max_tokens=2048)
     data   = await client.complete_json(system=..., messages=[...])   # parsed dict
 
@@ -23,6 +27,7 @@ import json
 import logging
 import re
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from app.core.config import settings
 from app.core.exceptions import ConfigurationError, ExternalServiceError
@@ -31,6 +36,27 @@ logger = logging.getLogger(__name__)
 
 _FENCE_OPEN_RE = re.compile(r"^```[a-zA-Z]*\s*")
 _FENCE_CLOSE_RE = re.compile(r"\s*```\s*$")
+
+_VALID_SLOTS = ("generic", "curator", "chat")
+
+
+def _check_slot(slot: str) -> str:
+    slot = (slot or "generic").lower()
+    if slot not in _VALID_SLOTS:
+        raise ValueError(f"unknown LLM slot {slot!r} (expected one of {_VALID_SLOTS})")
+    return slot
+
+
+def model_family(model: str) -> str:
+    """
+    "openai" for GPT-style models, "anthropic" for Claude-style.
+    Reverting providers = changing env model values only; call sites branch
+    on this (payload shape, tool schema) instead of on provider settings.
+    """
+    m = (model or "").strip().lower()
+    if m.startswith(("gpt-", "gpt_", "o1", "o3", "o4", "openai.", "openai-")) or "/gpt-" in m:
+        return "openai"
+    return "anthropic"
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -83,20 +109,38 @@ class AIClient(Protocol):
         ...
 
     def is_configured(self) -> bool:
-        """True when credentials for this provider exist."""
+        """True when credentials for this slot exist."""
         ...
+
+
+def _foundry_base_url(url: str) -> str:
+    """
+    Base URL for the Foundry OpenAI v1 data plane (responses/images).
+
+    Accepts a bare host ("https://<res>.services.ai.azure.com") or a full
+    portal path ("https://<res>.services.ai.azure.com/openai/v1/responses")
+    and returns the ".../openai/v1" root the SDK appends paths to.
+    """
+    url = (url or "").strip()
+    parsed = urlparse(url)
+    root = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else url.rstrip("/")
+    path = parsed.path or ""
+    if "/openai/v1" in path:
+        return root + path[: path.index("/openai/v1") + len("/openai/v1")]
+    return root + "/openai/v1"
 
 
 class AnthropicAIClient:
     """
-    Default adapter over the Bedrock/Anthropic factory in core.bedrock.
+    Bedrock adapter for one slot.
 
     The SDK client is created once and reused for the process lifetime —
     building a fresh client per call discarded connection pooling.
     An explicit `client`/`model_resolver` can be injected for tests.
     """
 
-    def __init__(self, client: Any | None = None, model_resolver=None):
+    def __init__(self, slot: str = "generic", client: Any | None = None, model_resolver=None):
+        self._slot = _check_slot(slot)
         self._client = client
         self._model_resolver = model_resolver
 
@@ -114,12 +158,12 @@ class AnthropicAIClient:
             return self._model_resolver()
         from app.core.bedrock import get_model
 
-        return get_model()
+        return get_model(self._slot)
 
     def is_configured(self) -> bool:
         from app.core.bedrock import is_configured as _configured
 
-        return _configured()
+        return _configured(self._slot)
 
     async def complete(
         self,
@@ -130,7 +174,7 @@ class AnthropicAIClient:
         model: str | None = None,
     ) -> str:
         if not self.is_configured():
-            raise ConfigurationError("No AI provider configured (USE_BEDROCK / ANTHROPIC_API_KEY)")
+            raise ConfigurationError(f"No AI provider configured for slot {self._slot!r} (AZURE_{self._slot.upper()}_* / AWS_{self._slot.upper()}_MODEL)")
         kwargs: dict[str, Any] = {
             "model": self._resolve_model(model),
             "max_tokens": max_tokens,
@@ -146,23 +190,104 @@ class AnthropicAIClient:
         except Exception as exc:  # narrow in Phase 4 retry layer
             logger.error("AI completion failed (%s): %s", type(exc).__name__, exc)
             raise ExternalServiceError(
-                settings.BEDROCK_MODEL if settings.USE_BEDROCK else "anthropic",
+                self._resolve_model(model),
                 f"completion failed: {exc}",
             ) from exc
 
 
-_default_client: AnthropicAIClient | None = None
+class AzureAIClient:
+    """
+    Azure Foundry adapter for one slot (OpenAI v1 data plane).
+
+    The resource exposes `{base}/openai/v1/*` (responses, images) with the
+    model in the body — not the classic `{base}/openai/deployments/*` path —
+    so this uses the OpenAI-compatible client, not AsyncAzureOpenAI.
+    """
+
+    def __init__(self, slot: str = "generic", client: Any | None = None):
+        self._slot = _check_slot(slot)
+        self._client = client
+
+    def _config(self) -> tuple[str, str, str, str]:
+        return settings.azure_slot(self._slot)
+
+    def is_configured(self) -> bool:
+        return settings.is_azure_configured(self._slot)
+
+    def _sdk_client(self):
+        if self._client is None:
+            from openai import AsyncOpenAI
+
+            url, key, _, _ = self._config()
+            self._client = AsyncOpenAI(
+                base_url=_foundry_base_url(url),
+                api_key=key,
+            )
+        return self._client
+
+    async def complete(
+        self,
+        *,
+        system: str | None = None,
+        messages: list[dict],
+        max_tokens: int = 1024,
+        model: str | None = None,
+    ) -> str:
+        _, _, _, deployment = self._config()
+        if not self.is_configured():
+            raise ConfigurationError(f"No AI provider configured for slot {self._slot!r} (AZURE_{self._slot.upper()}_* / AWS_{self._slot.upper()}_MODEL)")
+        kwargs: dict[str, Any] = {
+            "model": model or deployment,
+            "input": [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages],
+            "max_output_tokens": max_tokens,
+        }
+        if system is not None:
+            kwargs["instructions"] = system
+        try:
+            response = await self._sdk_client().responses.create(**kwargs)
+            return response.output_text or ""
+        except ExternalServiceError:
+            raise
+        except Exception as exc:
+            logger.error("AI completion failed (%s): %s", type(exc).__name__, exc)
+            raise ExternalServiceError(
+                model or deployment,
+                f"completion failed: {exc}",
+            ) from exc
 
 
-def get_ai_client() -> AIClient:
-    """Process-wide default AIClient (lazy)."""
-    global _default_client
-    if _default_client is None:
-        _default_client = AnthropicAIClient()
-    return _default_client
+_default_clients: dict[str, AIClient] = {}
 
 
-def set_ai_client(client: AIClient | None) -> None:
-    """Override the default client (tests / alternative providers)."""
-    global _default_client
-    _default_client = client
+def get_ai_client(slot: str = "generic") -> AIClient:
+    """
+    Process-wide default AIClient per slot (lazy).
+    Azure triplet set → Azure; else Bedrock (unconfigured when both empty,
+    preserving the mock fallbacks at call sites).
+    """
+    slot = _check_slot(slot)
+    client = _default_clients.get(slot)
+    if client is None:
+        client = AzureAIClient(slot) if settings.is_azure_configured(slot) else AnthropicAIClient(slot)
+        _default_clients[slot] = client
+    return client
+
+
+def set_ai_client(client: AIClient | None, slot: str = "generic") -> None:
+    """Override the default client for a slot (tests / alternative providers)."""
+    slot = _check_slot(slot)
+    if client is None:
+        _default_clients.pop(slot, None)
+    else:
+        _default_clients[slot] = client
+
+
+async def close_azure_clients() -> None:
+    """Close cached Azure clients on shutdown (no-op if never created)."""
+    for slot, client in list(_default_clients.items()):
+        sdk = getattr(client, "_client", None)
+        if isinstance(client, AzureAIClient) and sdk is not None:
+            try:
+                await sdk.close()
+            finally:
+                _default_clients.pop(slot, None)

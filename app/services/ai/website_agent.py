@@ -580,7 +580,7 @@ class WebsiteAgentService:
   if (!panel || !toggle) return;
 
   var CAMPAIGN_ID  = '{ad_id}';
-  var API_BASE     = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
+  var API_BASE     = '{settings.backend_base}';
   var STORAGE_KEY  = 'chat_session_' + CAMPAIGN_ID;
   var sending      = false;
 
@@ -722,7 +722,7 @@ class WebsiteAgentService:
 <script>
 (function () {{
   var AD_ID    = '{ad_id}';
-  var API_BASE = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
+  var API_BASE = '{settings.backend_base}';
 
   var nameEl   = document.getElementById('reg-name');
   var ageEl    = document.getElementById('reg-age');
@@ -860,7 +860,7 @@ class WebsiteAgentService:
 <script>
 (function () {{
   var AD_ID  = '{ad_id}';
-  var API    = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
+  var API    = '{settings.backend_base}';
   var dateEl = document.getElementById('appt-date');
   var slots  = document.getElementById('appt-slots');
   var tzEl   = document.getElementById('appt-tz');
@@ -1094,7 +1094,7 @@ class WebsiteAgentService:
 (function () {{
 
   var AD_ID    = '{ad_id}';
-  var API_BASE = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
+  var API_BASE = '{settings.backend_base}';
 
   /* ── Country list ──────────────────────────────────────────────────────── */
   var CTRY = [
@@ -1498,7 +1498,7 @@ class WebsiteAgentService:
 (function () {{
 
   var AD_ID    = '{ad_id}';
-  var API_BASE = '{(settings.BACKEND_PUBLIC_URL or "").rstrip("/")}';
+  var API_BASE = '{settings.backend_base}';
 
   /* ── Utility: find a button by ID or by text fallback ─────────────────── */
   function findBtn(id, hints) {{

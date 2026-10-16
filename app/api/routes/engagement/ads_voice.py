@@ -521,8 +521,8 @@ async def get_hybrid_voice_ws_url(
     token = create_access_token(
         user_id=user.id, role=user.role.value, company_id=user.company_id, token_version=user.token_version or 0
     )
-    base = (settings.BACKEND_PUBLIC_URL or "").rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
-    # ponytail: relative fallback serves same-origin dev; prod sets BACKEND_PUBLIC_URL (fail-fast in main)
+    base = settings.backend_base.replace("https://", "wss://").replace("http://", "ws://")
+    # ponytail: relative fallback serves same-origin dev; prod sets BACKEND_HOSTING_URL (fail-fast in main)
     path = f"/api/advertisements/{ad_id}/voice/ws?token={token}"
     return {"ws_url": f"{base}{path}" if base else path}
 

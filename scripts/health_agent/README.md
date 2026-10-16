@@ -41,9 +41,10 @@ Exit code is `0` if all probes pass/skip, `1` if anything fails.
    Default creds in `config.py`: `admin@medicare.com` / `medicare123`.
    Override via `HEALTH_ADMIN_EMAIL`, `HEALTH_ADMIN_PASSWORD`.
 3. Provider keys in `.env` (probes auto-skip when keys are missing):
-   `OPENAI_API_KEY`, `ELEVENLABS_API_KEY`, `GOOGLE_CLIENT_ID`,
-   `GOOGLE_CLIENT_SECRET`, `META_APP_ID`, plus `USE_BEDROCK=true` +
-   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for Bedrock.
+   `AZURE_IMAGE_GEN_API_URL` / `AZURE_IMAGE_GEN_API_KEY`, `ELEVENLABS_API_KEY`,
+   `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `META_APP_ID`, plus
+   `AWS_GENERIC_MODEL` (+ `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`,
+   or a boto IAM role) for Bedrock.
 
 ## Schedule it weekly (Windows Task Scheduler)
 

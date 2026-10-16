@@ -912,7 +912,7 @@ Respond with ONLY a valid JSON object, no markdown:
         language = bot_config.get("language", "en")
         agent_name = bot_config.get("bot_name") or voice_name
 
-        public_url = (settings.APP_PUBLIC_URL or "").rstrip("/")
+        public_url = settings.backend_base
         base = f"{public_url}/api/advertisements/{advertisement_id or ''}/voice-agent"
 
         # Tool 1 — check available slots for a date before presenting options to the caller
@@ -1363,7 +1363,7 @@ Respond with ONLY a valid JSON object, no markdown:
         sections.append(f"## Conversation Style\nSpeak in a {style} manner throughout the call.")
 
         # 8. Booking flow instructions
-        public_url = (settings.APP_PUBLIC_URL or "").rstrip("/")
+        public_url = settings.backend_base
         if public_url:
             sections.append(
                 "## Booking Flow (follow this sequence exactly after eligibility is confirmed)\n"

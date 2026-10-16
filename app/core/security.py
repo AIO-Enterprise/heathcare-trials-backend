@@ -8,10 +8,10 @@ JWT-based auth with role-based access control (RBAC).
 
 from datetime import datetime, timedelta
 
+import bcrypt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,19 +32,24 @@ _ONBOARDING_PREFIXES = (
     "/api/users",
     "/api/company",
     "/api/documents",
+    "/api/files",
 )
 
 # ─── Password hashing ────────────────────────────────────────────────────────
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
+# Raw bcrypt (not passlib): passlib 1.7.4 is unmaintained and raises on
+# bcrypt>=4.1 ("password cannot be longer than 72 bytes" during backend
+# detection), which 500s every register/login in fresh environments.
+# Hashes stay standard $2b$ — existing rows verify unchanged.
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except (ValueError, TypeError):
+        return False
 
 
 # ─── JWT ──────────────────────────────────────────────────────────────────────

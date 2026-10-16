@@ -82,21 +82,21 @@ async def create_review(
             if ad.status != AdStatus.UNDER_REVIEW:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Strategy review approval requires UNDER_REVIEW state, not '{ad.status.value}'",
+                    detail="This campaign is no longer waiting for strategy review. Please refresh and try again.",
                 )
             ad.status = AdStatus.ETHICS_REVIEW
         elif body.review_type == "ethics":
             if ad.status != AdStatus.ETHICS_REVIEW:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Ethics review approval requires ETHICS_REVIEW state, not '{ad.status.value}'",
+                    detail="This campaign is no longer waiting for ethics review. Please refresh and try again.",
                 )
             ad.status = AdStatus.APPROVED
     elif body.status in ("revision", "rejected"):
         if ad.status not in (AdStatus.UNDER_REVIEW, AdStatus.ETHICS_REVIEW):
             raise HTTPException(
                 status_code=400,
-                detail=f"Revision/rejection requires UNDER_REVIEW or ETHICS_REVIEW state, not '{ad.status.value}'",
+                detail="This campaign can't be sent back for changes from its current stage. Please refresh and try again.",
             )
         ad.status = AdStatus.UNDER_REVIEW
 

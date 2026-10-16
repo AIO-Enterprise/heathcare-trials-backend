@@ -32,17 +32,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
+def _cookie_flags() -> tuple[bool, str]:
+    """(secure, samesite) — SameSite=None forces Secure (browsers reject otherwise)."""
+    samesite = (settings.COOKIE_SAMESITE or "lax").lower()
+    if samesite == "none":
+        return True, "none"
+    if settings.COOKIE_SECURE is not None:
+        return settings.COOKIE_SECURE, samesite
+    return settings.APP_ENV == "prod", samesite
+
+
 def _set_auth_cookies(response: Response, token: str) -> None:
     max_age = settings.JWT_EXPIRE_MINUTES * 60
-    secure = settings.APP_ENV == "prod"
-    response.set_cookie("access_token", token, httponly=True, secure=secure, samesite="lax", path="/", max_age=max_age)
+    secure, samesite = _cookie_flags()
+    response.set_cookie("access_token", token, httponly=True, secure=secure, samesite=samesite, path="/", max_age=max_age)
     # ponytail: readable expiry lets JS schedule refresh without decoding the JWT; non-secret Unix timestamp
-    response.set_cookie("token_exp", str(int(time.time()) + max_age), httponly=False, secure=secure, samesite="lax", path="/", max_age=max_age)
+    response.set_cookie("token_exp", str(int(time.time()) + max_age), httponly=False, secure=secure, samesite=samesite, path="/", max_age=max_age)
 
 
 def _clear_auth_cookies(response: Response) -> None:
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("token_exp", path="/")
+    _, samesite = _cookie_flags()
+    # ponytail: delete must repeat samesite/secure or the browser keeps the cookie
+    response.delete_cookie("access_token", path="/", samesite=samesite)
+    response.delete_cookie("token_exp", path="/", samesite=samesite)
 
 
 def _token_response(user: User, company: Company, token: str) -> TokenResponse:

@@ -36,9 +36,9 @@ def load_file(path: str) -> str:
 
 
 def call_trainer(client, trainer_skill: str, template: str, company_data: dict) -> str:
-    logger.info("Calling Claude for skill training...")
+    logger.info("Calling AI trainer for skill training...")
     response = client.messages.create(
-        model=get_model(),
+        model=get_model("generic"),
         max_tokens=4096,
         system=trainer_skill,
         messages=[
@@ -99,7 +99,7 @@ class TrainingService:
             template_path = os.path.join(TEMPLATES_DIR, f"{skill_name}_template.md")
             template = load_file(template_path)
 
-            if is_configured():
+            if is_configured("generic"):
                 client = get_client()
                 filled = await asyncio.to_thread(call_trainer, client, trainer_skill, template, company_data)
             else:
@@ -179,8 +179,8 @@ def train():
     COMPANY_DATA_PATH = os.path.join(BASE_DIR, "sample_company.json")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    if not is_configured():
-        raise OSError("No AI backend configured. Set USE_BEDROCK=true or ANTHROPIC_API_KEY.")
+    if not is_configured("generic"):
+        raise OSError("No AI backend configured. Set AZURE_GENERIC_* or AWS_GENERIC_MODEL.")
 
     client = get_client()
     trainer_skill = load_file(TRAINER_SKILL)
