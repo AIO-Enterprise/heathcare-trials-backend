@@ -31,6 +31,7 @@ import logging
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -124,7 +125,10 @@ async def get_slots(
         # Return an empty slot list rather than a 400 — the frontend can
         # show "no availability" without crashing.
         bc = _booking_config(ad)
-        return AvailableSlotsResponse(date=date, duration_minutes=bc["slot_duration_minutes"], slots=[])
+        return JSONResponse(
+            content=AvailableSlotsResponse(date=date, duration_minutes=bc["slot_duration_minutes"], slots=[]).model_dump(),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     bc = _booking_config(ad)
     duration = bc["slot_duration_minutes"]
@@ -166,7 +170,10 @@ async def get_slots(
             )
         )
 
-    return AvailableSlotsResponse(date=date, duration_minutes=duration, slots=slot_list)
+    return JSONResponse(
+        content=AvailableSlotsResponse(date=date, duration_minutes=duration, slots=slot_list).model_dump(),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @router.post("/advertisements/{ad_id}/appointments", response_model=AppointmentOut, status_code=201)

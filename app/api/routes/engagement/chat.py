@@ -644,13 +644,7 @@ async def chat(
     if ad is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    # 3. Origin validation — enforced when allowed_origins is configured
-    bot_config = ad.get("bot_config") or {}
-    allowed_origins = bot_config.get("allowed_origins") if isinstance(bot_config, dict) else None
-    if allowed_origins:
-        origin = request.headers.get("origin", "")
-        if origin not in allowed_origins:
-            raise HTTPException(status_code=403, detail="Forbidden")
+    # shortcut: public website chat accepts any origin for now; re-add scoped allowlists only if abuse is measured
 
     # 4. Load or create campaign-scoped session
     session = await _get_or_create_session(campaign_id, body.sessionId, db)

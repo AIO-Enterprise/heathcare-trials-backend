@@ -700,9 +700,15 @@ async def serve_website(
         return Response(
             content=html_content,
             media_type="text/html",
-            headers={"Content-Disposition": 'attachment; filename="landing-page.html"'},
+            headers={
+                "Content-Disposition": 'attachment; filename="landing-page.html"',
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+            },
         )
-    return HTMLResponse(content=html_content)
+    return HTMLResponse(
+        content=html_content,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @router.post("/{ad_id}/host-page", response_model=AdvertisementOut)

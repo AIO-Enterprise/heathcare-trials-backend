@@ -21,6 +21,7 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,7 +74,7 @@ async def get_public_campaign(
     win_end = ad.trial_end_date if ad.trial_end_date else today + timedelta(days=_DEFAULT_BOOKING_DAYS)
 
     bc = ad.booking_config if isinstance(ad.booking_config, dict) else {}
-    return PublicCampaignOut(
+    payload = PublicCampaignOut(
         id=ad.id,
         title=ad.title,
         questionnaire=ad.questionnaire,
@@ -81,6 +82,10 @@ async def get_public_campaign(
         booking_window_end=str(win_end),
         slot_duration_minutes=int(bc.get("slot_duration_minutes") or 30),
         max_per_slot=int(bc.get("max_per_slot") or 3),
+    )
+    return JSONResponse(
+        content=payload.model_dump(),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
 
 

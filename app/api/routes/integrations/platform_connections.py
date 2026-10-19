@@ -40,6 +40,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/platform-connections", tags=["Platform Connections"])
 
+
+def _popup_response(msg_type: str, message: str, extra: str = "") -> HTMLResponse:
+    return HTMLResponse(
+        _popup_html(msg_type, message, extra),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
 # ─── Popup close HTML ─────────────────────────────────────────────────────────
 
 
@@ -139,10 +146,10 @@ async def meta_oauth_callback(
     """
     if error:
         msg = error_description or error
-        return HTMLResponse(_popup_html("meta_oauth_error", f"Connection denied: {msg}", ", platform: 'meta'"))
+        return _popup_response("meta_oauth_error", f"Connection denied: {msg}", ", platform: 'meta'")
 
     if not code or not state:
-        return HTMLResponse(_popup_html("meta_oauth_error", "Missing code or state parameter", ", platform: 'meta'"))
+        return _popup_response("meta_oauth_error", "Missing code or state parameter", ", platform: 'meta'")
 
     # Decode state JWT to recover user identity
     try:
@@ -150,9 +157,7 @@ async def meta_oauth_callback(
         user_id: str = payload["user_id"]
         company_id: str = payload["company_id"]
     except (JWTError, Exception):
-        return HTMLResponse(
-            _popup_html("meta_oauth_error", "Invalid or expired state — please try again", ", platform: 'meta'")
-        )
+        return _popup_response("meta_oauth_error", "Invalid or expired state — please try again", ", platform: 'meta'")
 
     try:
         from app.services.ads.meta_ads_service import MetaAdsService
@@ -209,9 +214,9 @@ async def meta_oauth_callback(
     except Exception as exc:
         logger.error("Meta OAuth callback failed: %s", exc, exc_info=True)
         err_msg = str(exc)[:120]
-        return HTMLResponse(_popup_html("meta_oauth_error", f"Connection failed: {err_msg}", ", platform: 'meta'"))
+        return _popup_response("meta_oauth_error", f"Connection failed: {err_msg}", ", platform: 'meta'")
 
-    return HTMLResponse(_popup_html("meta_oauth_success", "Connected successfully!", ", platform: 'meta'"))
+    return _popup_response("meta_oauth_success", "Connected successfully!", ", platform: 'meta'")
 
 
 # ─── 3. List connections ──────────────────────────────────────────────────────
@@ -408,21 +413,17 @@ async def google_oauth_callback(
     """
     if error:
         msg = error_description or error
-        return HTMLResponse(_popup_html("google_oauth_error", f"Connection denied: {msg}", ", platform: 'google'"))
+        return _popup_response("google_oauth_error", f"Connection denied: {msg}", ", platform: 'google'")
 
     if not code or not state:
-        return HTMLResponse(
-            _popup_html("google_oauth_error", "Missing code or state parameter", ", platform: 'google'")
-        )
+        return _popup_response("google_oauth_error", "Missing code or state parameter", ", platform: 'google'")
 
     try:
         payload = pyjwt.decode(state, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
         user_id: str = payload["user_id"]
         company_id: str = payload["company_id"]
     except (JWTError, Exception):
-        return HTMLResponse(
-            _popup_html("google_oauth_error", "Invalid or expired state — please try again", ", platform: 'google'")
-        )
+        return _popup_response("google_oauth_error", "Invalid or expired state — please try again", ", platform: 'google'")
 
     try:
         from app.services.ads.google_ads_service import GoogleAdsService
@@ -462,9 +463,9 @@ async def google_oauth_callback(
     except Exception as exc:
         logger.error("Google OAuth callback failed: %s", exc, exc_info=True)
         err_msg = str(exc)[:120]
-        return HTMLResponse(_popup_html("google_oauth_error", f"Connection failed: {err_msg}", ", platform: 'google'"))
+        return _popup_response("google_oauth_error", f"Connection failed: {err_msg}", ", platform: 'google'")
 
-    return HTMLResponse(_popup_html("google_oauth_success", "Connected successfully!", ", platform: 'google'"))
+    return _popup_response("google_oauth_success", "Connected successfully!", ", platform: 'google'")
 
 
 # ─── 3. List accessible customers ─────────────────────────────────────────────
