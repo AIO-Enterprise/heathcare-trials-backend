@@ -5,6 +5,7 @@ import logging
 import os
 from html import escape as _html_escape
 
+from app.core.config import settings
 from app.core.llm import get_ai_client
 from app.core.media import media_url
 from app.models.models import Advertisement, BrandKit, Company
@@ -652,23 +653,1050 @@ class WebsiteAgentService(WebsiteUIMixin):
         brand_kit: BrandKit | None,
         company: Company | None,
     ) -> str:
+        from datetime import date, timedelta
+
+        bot_config = ad.bot_config if isinstance(ad.bot_config, dict) else {}
+        bot_name = str(bot_config.get("name") or "Assistant")
+        bot_welcome = str(
+            bot_config.get("welcome_message") or f"Hi! I'm {bot_name}. How can I help you today?"
+        )
+        today = date.today()
+        win_start = max(ad.trial_start_date, today) if ad.trial_start_date else today
+        win_end = ad.trial_end_date if ad.trial_end_date else today + timedelta(days=30)
+
         body = await self._generate_body(ad, brand_kit, company)
         css = self._build_css(brand_kit)
-        html = self._wrap_html(body, css)
+        html = self._wrap_html(
+            ad.title,
+            css,
+            body,
+            [t.lower() for t in (ad.ad_type or [])],
+            bot_name,
+            bot_welcome,
+            ad_id=ad.id,
+            booking_window_start=str(win_start),
+            booking_window_end=str(win_end),
+        )
+        # Claude's country-flag emoji arrive as lone surrogates — invalid UTF-8.
+        html = html.encode("utf-8", errors="ignore").decode("utf-8")
         filename = f"website_{ad.id}.html"
         return file_storage.save_bytes(html.encode("utf-8"), f"outputs/{self.company_id}/{ad.id}", filename)
 
-    def _wrap_html(self, body: str, css: str) -> str:
+    def _wrap_html(
+        self,
+        title: str,
+        css: str,
+        body: str,
+        ad_types: list[str],
+        bot_name: str = "Assistant",
+        bot_welcome: str = "Hi! How can I help you today?",
+        ad_id: str = "",
+        booking_window_start: str = "",
+        booking_window_end: str = "",
+    ) -> str:
+        # HTML-text context escaping for tenant-supplied strings (title, bot
+        # name/welcome). The AI-generated body is markup by design and must
+        # NOT be escaped; booking windows are server-generated dates.
+        title = _html_escape(title or "", quote=True)
+        bot_name = _html_escape(bot_name or "Assistant", quote=True)
+        bot_welcome = _html_escape(bot_welcome or "", quote=False)
+        has_chat = "chatbot" in ad_types
+        has_voice = "voicebot" in ad_types
+        has_interact = has_chat or has_voice
+
+        survey_js = """
+<script>
+/* ── Survey engine ─────────────────────────────────────────────────────── */
+(function () {
+  var steps    = Array.from(document.querySelectorAll('.survey-step'));
+  var current  = 0;
+  var answers  = {};
+  var progress = document.getElementById('survey-progress');
+  var counter  = document.getElementById('survey-step-count');
+  var btnPrev  = document.getElementById('survey-prev');
+  var btnNext  = document.getElementById('survey-next');
+  var btnSub   = document.getElementById('survey-submit');
+  var result   = document.getElementById('survey-result');
+
+  if (!steps.length) return;
+
+  function setProgress() {
+    var pct = (current / steps.length) * 100;
+    if (progress) progress.style.width = pct + '%';
+    if (counter)  counter.textContent  = 'Question ' + (current + 1) + ' of ' + steps.length;
+  }
+
+  function show(idx) {
+    steps.forEach(function (s, i) { s.classList.toggle('active', i === idx); });
+    if (btnPrev) btnPrev.style.display = idx > 0 ? 'inline-block' : 'none';
+    var last = idx === steps.length - 1;
+    if (btnNext) btnNext.style.display = last ? 'none' : 'inline-block';
+    if (btnSub)  btnSub.style.display  = last ? 'inline-block' : 'none';
+    setProgress();
+  }
+
+  /* Answer selection */
+  document.querySelectorAll('.option-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var step = btn.closest('.survey-step');
+      step.querySelectorAll('.option-btn').forEach(function (b) { b.classList.remove('selected'); });
+      btn.classList.add('selected');
+      var idx = steps.indexOf(step);
+      var eligible = (step.dataset.eligible || '').split(',').map(function (v) { return v.trim().toLowerCase(); });
+      answers[idx] = { value: btn.dataset.value, ok: eligible.includes(btn.dataset.value.toLowerCase()) };
+    });
+  });
+
+  /* Shake animation on no-answer-next */
+  function shake(el) {
+    el.style.animation = 'none';
+    el.offsetHeight; /* reflow */
+    el.style.animation = 'survey-shake 0.4s ease';
+  }
+
+  if (btnNext) btnNext.addEventListener('click', function () {
+    if (!answers[current]) { shake(steps[current]); return; }
+    current++;
+    show(current);
+  });
+
+  if (btnPrev) btnPrev.addEventListener('click', function () {
+    current--;
+    show(current);
+  });
+
+  /* Build answer payload for registration form — stored on window so reg form JS can read them */
+  window._surveyAnswers  = [];
+  window._surveyEligible = false;
+
+  if (btnSub) btnSub.addEventListener('click', function () {
+    if (!answers[current]) { shake(steps[current]); return; }
+    /* Score */
+    var total   = steps.length;
+    var okCount = Object.values(answers).filter(function (a) { return a.ok; }).length;
+    var pass    = okCount >= Math.ceil(total * 0.6);
+    window._surveyEligible = pass;
+
+    /* Build answers array for submission */
+    window._surveyAnswers = steps.map(function (s, i) {
+      var ans = answers[i] || {};
+      return {
+        question_id:     s.dataset.step || String(i + 1),
+        question_text:   (s.querySelector('.survey-question') || {}).textContent || '',
+        selected_option: ans.value || '',
+        is_eligible:     ans.ok === true ? true : ans.ok === false ? false : null
+      };
+    });
+
+    /* Hide questions + nav buttons, show result (voice-row stays visible) */
+    steps.forEach(function (s) { s.style.display = 'none'; });
+    var navRight = document.querySelector('.survey-nav-right');
+    if (navRight) navRight.style.display = 'none';
+    /* .survey-voice-row stays visible inside .survey-nav */
+    if (progress && progress.parentElement) progress.style.width = '100%';
+    if (counter) counter.textContent = 'Complete';
+
+    var elEl = document.getElementById('result-eligible');
+    var inEl = document.getElementById('result-ineligible');
+    if (elEl) elEl.style.display = pass ? 'block' : 'none';
+    if (inEl) inEl.style.display = pass ? 'none'  : 'block';
+    if (result) result.style.display = 'block';
+
+    /* Show registration form after short delay */
+    setTimeout(function () {
+      var regSec = document.getElementById('reg-section');
+      if (regSec) {
+        regSec.style.display = 'block';
+        var regNote = document.getElementById('reg-note');
+        if (regNote) {
+          regNote.style.display = 'block';
+          if (pass) {
+            regNote.className = 'reg-note eligible';
+            regNote.textContent = 'Great news \u2014 you appear to be eligible! Please fill in your details so the study team can reach you.';
+          } else {
+            regNote.className = 'reg-note ineligible';
+            regNote.textContent = 'Thank you for completing the survey. Please fill in your details so the study team can contact you with more information.';
+          }
+        }
+        regSec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 1200);
+  });
+
+  /* Consent checkbox — show submit button when ticked */
+  var consentCheck  = document.getElementById('consent-check');
+  var consentSubmit = document.getElementById('consent-submit');
+  var consentThanks = document.getElementById('consent-thanks');
+  if (consentCheck && consentSubmit) {
+    consentCheck.addEventListener('change', function () {
+      consentSubmit.style.display = this.checked ? 'block' : 'none';
+    });
+    consentSubmit.addEventListener('click', function () {
+      consentSubmit.style.display = 'none';
+      consentCheck.disabled = true;
+      if (consentThanks) consentThanks.style.display = 'block';
+    });
+  }
+
+  show(0);
+})();
+</script>
+<style>
+  @keyframes survey-shake {
+    0%,100% { transform: translateX(0); }
+    20%,60%  { transform: translateX(-8px); }
+    40%,80%  { transform: translateX(8px); }
+  }
+</style>"""
+
+        # Floating chat widget (Python-injected, always correct)
+        chat_float_html = ""
+        chat_js = ""
+        if has_chat:
+            chat_float_html = f"""
+<div id="chat-float">
+  <div class="chat-panel" id="chat-panel">
+    <div class="chat-panel__header">
+      <div class="chat-avatar">🤖</div>
+      <div class="chat-agent-info">
+        <p class="chat-agent-name">{bot_name}</p>
+        <p class="chat-agent-status">Online &middot; Ready to help</p>
+      </div>
+      <button class="chat-close-btn" id="chat-close" aria-label="Close chat">&#10005;</button>
+    </div>
+    <div class="chat-messages" id="chat-messages">
+      <div class="chat-bubble bot">{bot_welcome}</div>
+    </div>
+    <div class="chat-footer">
+      <input id="chat-input" class="chat-input" type="text" placeholder="Type your message&hellip;" autocomplete="off" />
+      <button class="chat-send-btn" id="chat-send" aria-label="Send">&#10148;</button>
+    </div>
+  </div>
+  <button class="chat-toggle-btn" id="chat-toggle" aria-label="Open chat" style="position:relative;">
+    💬
+    <span class="chat-unread" id="chat-unread">1</span>
+  </button>
+</div>"""
+
+            chat_js = f"""
+<script>
+/* ── Floating chat widget ──────────────────────────────────────────────── */
+(function () {{
+  var panel   = document.getElementById('chat-panel');
+  var toggle  = document.getElementById('chat-toggle');
+  var close   = document.getElementById('chat-close');
+  var input   = document.getElementById('chat-input');
+  var send    = document.getElementById('chat-send');
+  var box     = document.getElementById('chat-messages');
+  var unread  = document.getElementById('chat-unread');
+  if (!panel || !toggle) return;
+
+  var CAMPAIGN_ID  = '{ad_id}';
+  var API_BASE     = '{settings.backend_base}';
+  var STORAGE_KEY  = 'chat_session_' + CAMPAIGN_ID;
+  var sending      = false;
+
+  /* Session ID is scoped per campaign — persists across page refreshes */
+  var sessionId = localStorage.getItem(STORAGE_KEY) || null;
+
+  function openChat() {{
+    panel.classList.add('open');
+    if (unread) unread.style.display = 'none';
+    if (input)  input.focus();
+  }}
+  function closeChat() {{ panel.classList.remove('open'); }}
+
+  toggle.addEventListener('click', function () {{
+    panel.classList.contains('open') ? closeChat() : openChat();
+  }});
+  if (close) close.addEventListener('click', closeChat);
+
+  function addMsg(text, cls) {{
+    var b = document.createElement('div');
+    b.className = 'chat-bubble ' + cls;
+    b.textContent = text;
+    box.appendChild(b);
+    box.scrollTop = box.scrollHeight;
+    return b;
+  }}
+
+  function setInput(disabled) {{
+    sending        = disabled;
+    input.disabled = disabled;
+    send.disabled  = disabled;
+  }}
+
+  async function sendMsg() {{
+    var val = (input.value || '').trim();
+    if (!val || sending) return;
+    addMsg(val, 'user');
+    input.value = '';
+    setInput(true);
+
+    var typing = addMsg('\u2026', 'bot');
+
+    try {{
+      var payload = {{ campaignId: CAMPAIGN_ID, message: val }};
+      if (sessionId) payload.sessionId = sessionId;
+
+      var resp = await fetch(API_BASE + '/api/chat', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(payload)
+      }});
+      var data  = resp.ok ? await resp.json() : null;
+      var reply = (data && data.reply) ? data.reply : "I\u2019m sorry, I couldn\u2019t process that. Please try again.";
+
+      /* Persist the session id returned by the server */
+      if (data && data.sessionId) {{
+        sessionId = data.sessionId;
+        try {{ localStorage.setItem(STORAGE_KEY, sessionId); }} catch (e) {{}}
+      }}
+
+      box.removeChild(typing);
+      addMsg(reply, 'bot');
+    }} catch (e) {{
+      box.removeChild(typing);
+      addMsg("I\u2019m sorry, something went wrong. Please try again.", 'bot');
+    }}
+
+    setInput(false);
+    input.focus();
+  }}
+
+  if (send)  send.addEventListener('click', sendMsg);
+  if (input) input.addEventListener('keydown', function (e) {{ if (e.key === 'Enter') sendMsg(); }});
+
+  /* Auto-open after survey reveal */
+  var observer = new MutationObserver(function (mutations) {{
+    mutations.forEach(function (m) {{
+      if (m.type === 'attributes' && m.attributeName === 'style') {{
+        var ia = document.getElementById('interaction-reveal');
+        if (ia && ia.style.display !== 'none') {{
+          setTimeout(openChat, 600);
+          observer.disconnect();
+        }}
+      }}
+    }});
+  }});
+  var ia = document.getElementById('interaction-reveal');
+  if (ia) observer.observe(ia, {{ attributes: true }});
+  else setTimeout(openChat, 3000);
+}})();
+</script>"""
+
+        # Registration form — injected into body before the interaction section
+        reg_form_html = f"""
+<section id="reg-section">
+  <div class="reg-card">
+    <h2 class="reg-title">Your Details</h2>
+    <p class="reg-sub">Help the study team get in touch with you.</p>
+    <div id="reg-note" class="reg-note ineligible" style="display:none"></div>
+    <div class="reg-error" id="reg-error"></div>
+    <div class="reg-done" id="reg-done">
+      &#10003;&ensp;Thank you! Your details have been received.<br>
+      A member of the study team will be in touch with you shortly.
+      <div id="reg-book-wrap" style="display:none;margin-top:18px;">
+        <p style="margin:0 0 10px;font-size:.9rem;color:#374151;">You appear to be eligible for this trial. Would you like to book your first visit?</p>
+        <button id="reg-book-btn" style="background:var(--accent,#10b981);color:#fff;border:none;border-radius:50px;padding:12px 28px;font-size:.95rem;font-weight:700;cursor:pointer;font-family:inherit;">&#128197;&ensp;Book Appointment</button>
+      </div>
+    </div>
+    <div id="reg-form-fields">
+      <div class="reg-field">
+        <label class="reg-label" for="reg-name">Full Name *</label>
+        <input class="reg-input" id="reg-name" type="text" placeholder="e.g. Jane Smith" autocomplete="name" />
+      </div>
+      <div class="reg-row">
+        <div class="reg-field">
+          <label class="reg-label" for="reg-age">Age *</label>
+          <input class="reg-input" id="reg-age" type="number" placeholder="e.g. 34" min="1" max="120" />
+        </div>
+        <div class="reg-field">
+          <label class="reg-label" for="reg-sex">Sex *</label>
+          <select class="reg-select" id="reg-sex">
+            <option value="">Select&hellip;</option>
+            <option value="male">Male</option>
+            <option value="female">Female</option>
+            <option value="other">Other</option>
+            <option value="prefer_not_to_say">Prefer not to say</option>
+          </select>
+        </div>
+      </div>
+      <div class="reg-field">
+        <label class="reg-label" for="reg-phone">Phone Number *</label>
+        <input class="reg-input" id="reg-phone" type="tel" placeholder="e.g. +1 555 123 4567" autocomplete="tel" />
+      </div>
+      <button class="reg-btn" id="reg-submit">Submit Details</button>
+      <p class="reg-privacy">Your information will only be used by the study team to contact you about this trial. It will not be shared with third parties.</p>
+    </div>
+  </div>
+</section>
+<script>
+(function () {{
+  var AD_ID    = '{ad_id}';
+  var API_BASE = '{settings.backend_base}';
+
+  var nameEl   = document.getElementById('reg-name');
+  var ageEl    = document.getElementById('reg-age');
+  var sexEl    = document.getElementById('reg-sex');
+  var phoneEl  = document.getElementById('reg-phone');
+  var submitEl = document.getElementById('reg-submit');
+  var errorEl  = document.getElementById('reg-error');
+  var doneEl   = document.getElementById('reg-done');
+  var fieldsEl = document.getElementById('reg-form-fields');
+  var noteEl   = document.getElementById('reg-note');
+
+  /* Note content is set by survey JS before revealing #reg-section */
+
+  function showError(msg) {{
+    if (!errorEl) return;
+    errorEl.textContent = msg;
+    errorEl.style.display = 'block';
+  }}
+  function hideError() {{ if (errorEl) errorEl.style.display = 'none'; }}
+
+  if (!submitEl) return;
+  submitEl.addEventListener('click', async function () {{
+    hideError();
+    var name  = (nameEl  && nameEl.value.trim())  || '';
+    var age   = parseInt((ageEl   && ageEl.value)   || '', 10);
+    var sex   = (sexEl   && sexEl.value)   || '';
+    var phone = (phoneEl && phoneEl.value.trim())  || '';
+
+    if (!name)                     {{ showError('Please enter your full name.');   return; }}
+    if (isNaN(age) || age < 1 || age > 120) {{ showError('Please enter a valid age.');    return; }}
+    if (!sex)                      {{ showError('Please select your sex.');         return; }}
+    if (!phone || phone.length < 5){{ showError('Please enter a valid phone number.'); return; }}
+
+    submitEl.disabled    = true;
+    submitEl.textContent = 'Submitting\u2026';
+
+    /* Get answers + eligibility captured by survey engine */
+    var answers  = window._surveyAnswers  || [];
+    var eligible = window._surveyEligible || false;
+
+    try {{
+      var resp = await fetch(API_BASE + '/api/advertisements/' + AD_ID + '/survey-responses', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          full_name:   name,
+          age:         age,
+          sex:         sex,
+          phone:       phone,
+          answers:     answers,
+          is_eligible: eligible
+        }})
+      }});
+      if (!resp.ok) {{
+        var err = await resp.json().catch(function () {{ return {{}}; }});
+        throw new Error((err.detail) || ('Submission failed (HTTP ' + resp.status + ')'));
+      }}
+      /* Success */
+      var regData = await resp.json().catch(function () {{ return {{}}; }});
+      window._surveyResponseId = regData.id || null;
+      if (fieldsEl) fieldsEl.style.display = 'none';
+      if (doneEl)   doneEl.style.display   = 'block';
+      if (noteEl)   noteEl.style.display   = 'none';
+
+      /* Show book-appointment button if eligible */
+      if (eligible) {{
+        var bookWrap = document.getElementById('reg-book-wrap');
+        if (bookWrap) bookWrap.style.display = 'block';
+        /* Pre-fill appt name/phone from reg form */
+        var an = document.getElementById('appt-patient-name');
+        var ap = document.getElementById('appt-patient-phone');
+        if (an) an.value = name;
+        if (ap) ap.value = phone;
+      }}
+
+      /* Reveal interaction section after brief delay */
+      setTimeout(function () {{
+        var ia = document.getElementById('interaction-reveal');
+        if (ia) {{
+          ia.style.display = '';
+          ia.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+        }}
+      }}, 2000);
+    }} catch (e) {{
+      showError(e.message || 'Something went wrong. Please try again.');
+      submitEl.disabled    = false;
+      submitEl.textContent = 'Submit Details';
+    }}
+  }});
+}})();
+</script>
+<section id="appt-section" style="display:none;background:#f0f4f8;padding:48px 24px;">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:20px;padding:40px 36px;box-shadow:0 4px 24px rgba(0,0,0,0.07);">
+    <div style="text-align:center;margin-bottom:24px;">
+      <div style="font-size:2.2rem;margin-bottom:6px;">&#128197;</div>
+      <h2 style="font-size:1.4rem;font-weight:800;color:var(--primary,#1e3a5f);margin:0 0 6px;">Book Your First Visit</h2>
+      <p style="color:#64748b;font-size:.9rem;line-height:1.5;margin:0;">Select a date and an available time slot for your first trial appointment.</p>
+    </div>
+    <div style="margin-bottom:14px;">
+      <label style="display:block;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#64748b;margin-bottom:6px;">Full Name</label>
+      <input id="appt-patient-name" type="text" placeholder="e.g. Jane Smith" style="width:100%;box-sizing:border-box;padding:10px 13px;border:1.5px solid #e2e8f0;border-radius:9px;font-size:.9rem;font-family:inherit;outline:none;" />
+    </div>
+    <div style="margin-bottom:18px;">
+      <label style="display:block;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#64748b;margin-bottom:6px;">Phone Number</label>
+      <input id="appt-patient-phone" type="tel" placeholder="e.g. +1 555 123 4567" style="width:100%;box-sizing:border-box;padding:10px 13px;border:1.5px solid #e2e8f0;border-radius:9px;font-size:.9rem;font-family:inherit;outline:none;" />
+    </div>
+    <div style="margin-bottom:14px;">
+      <label style="display:block;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#64748b;margin-bottom:6px;">Select Date</label>
+      <input id="appt-date" type="date" style="width:100%;box-sizing:border-box;padding:10px 13px;border:1.5px solid #e2e8f0;border-radius:9px;font-size:.9rem;font-family:inherit;outline:none;" />
+    </div>
+    <div style="margin-bottom:18px;">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:8px;">
+        <label style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#64748b;">Available Slots</label>
+        <span id="appt-tz" style="font-size:.65rem;color:#94a3b8;"></span>
+      </div>
+      <div id="appt-slots" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
+        <p style="font-size:.82rem;color:#94a3b8;grid-column:1/-1;">Select a date above to see available slots.</p>
+      </div>
+    </div>
+    <div id="appt-status" style="display:none;padding:10px 13px;border-radius:9px;font-size:.84rem;font-weight:600;margin-bottom:14px;"></div>
+    <button id="appt-confirm-btn" style="width:100%;background:var(--accent,#10b981);color:#fff;border:none;border-radius:50px;padding:13px;font-size:.95rem;font-weight:700;cursor:pointer;font-family:inherit;">Confirm Appointment &#8594;</button>
+    <div id="appt-done" style="display:none;text-align:center;padding:20px;background:rgba(16,185,129,.08);border:2px solid var(--accent,#10b981);border-radius:13px;margin-top:16px;">
+      <div style="font-size:1.8rem;margin-bottom:6px;">&#9989;</div>
+      <p id="appt-done-msg" style="font-size:1rem;font-weight:800;color:#065f46;margin:0 0 4px;">Appointment confirmed!</p>
+      <p style="font-size:.83rem;color:#64748b;margin:0;">The study team will send you a confirmation shortly.</p>
+    </div>
+  </div>
+</section>
+<style>
+#appt-slots button{{padding:9px 4px;text-align:center;border:1.5px solid #e2e8f0;border-radius:8px;cursor:pointer;font-size:.78rem;font-weight:600;color:#374151;background:#fff;transition:all .15s;font-family:inherit;}}
+#appt-slots button:hover:not(:disabled){{border-color:var(--primary,#1e3a5f);color:var(--primary,#1e3a5f);background:#f8fafc;}}
+#appt-slots button.appt-sel{{background:var(--primary,#1e3a5f);color:#fff;border-color:var(--primary,#1e3a5f);}}
+#appt-slots button:disabled{{opacity:.28;cursor:not-allowed;}}
+</style>
+<script>
+(function () {{
+  var AD_ID  = '{ad_id}';
+  var API    = '{settings.backend_base}';
+  var dateEl = document.getElementById('appt-date');
+  var slots  = document.getElementById('appt-slots');
+  var tzEl   = document.getElementById('appt-tz');
+  var stEl   = document.getElementById('appt-status');
+  var cBtn   = document.getElementById('appt-confirm-btn');
+  var doneEl = document.getElementById('appt-done');
+  var msgEl  = document.getElementById('appt-done-msg');
+  var nameEl = document.getElementById('appt-patient-name');
+  var phEl   = document.getElementById('appt-patient-phone');
+  var bookBtn= document.getElementById('reg-book-btn');
+  var apptSec= document.getElementById('appt-section');
+  if (!dateEl || !cBtn) return;
+
+  /* Restrict date to the campaign booking window */
+  var WIN_START = '{booking_window_start}';
+  var WIN_END   = '{booking_window_end}';
+  var now = new Date();
+  var todayStr = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+  dateEl.min = WIN_START && WIN_START > todayStr ? WIN_START : todayStr;
+  if (WIN_END) dateEl.max = WIN_END;
+  try {{ tzEl.textContent = '('+Intl.DateTimeFormat().resolvedOptions().timeZone+')'; }} catch(e) {{}}
+
+  var _cache = {{}}, _selTime = '';
+
+  function esc(s) {{ return String(s).replace(/[&<>"']/g, function(c) {{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]; }}); }}
+
+  function showSt(msg, tp) {{
+    stEl.innerHTML = msg;
+    var bg = tp === 'error' ? '#fef2f2;color:#b91c1c;border:1.5px solid #fecaca'
+           : tp === 'ok'    ? '#f0fdf4;color:#15803d;border:1.5px solid #bbf7d0'
+           :                  '#eff6ff;color:#1d4ed8;border:1.5px solid #bfdbfe';
+    stEl.style.cssText = 'display:block;padding:10px 13px;border-radius:9px;font-size:.84rem;font-weight:600;margin-bottom:14px;background:' + bg;
+  }}
+  function hideSt() {{ stEl.style.display = 'none'; }}
+
+  function renderSlots(data) {{
+    _selTime = '';
+    slots.innerHTML = '';
+    var any = false;
+    (data || []).forEach(function(s) {{
+      var b = document.createElement('button');
+      b.textContent = s.label;
+      if (!s.available) {{
+        b.disabled = true;
+      }} else {{
+        any = true;
+        b.addEventListener('click', function() {{
+          _selTime = s.time;
+          slots.querySelectorAll('button').forEach(function(x) {{ x.classList.remove('appt-sel'); }});
+          b.classList.add('appt-sel');
+          hideSt();
+        }});
+      }}
+      slots.appendChild(b);
+    }});
+    if (!any) slots.innerHTML = '<p style="font-size:.82rem;color:#94a3b8;grid-column:1/-1;">No slots available &mdash; try another date.</p>';
+  }}
+
+  function loadSlots(d) {{
+    if (_cache[d]) {{ renderSlots(_cache[d]); return; }}
+    slots.innerHTML = '<p style="font-size:.82rem;color:#94a3b8;grid-column:1/-1;">Loading slots&hellip;</p>';
+    fetch(API+'/api/advertisements/'+AD_ID+'/appointments/slots?date='+d)
+      .then(function(r) {{ return r.ok ? r.json() : Promise.reject(r.status); }})
+      .then(function(data) {{ _cache[d] = data.slots || []; renderSlots(_cache[d]); }})
+      .catch(function() {{ slots.innerHTML = '<p style="font-size:.82rem;color:#ef4444;grid-column:1/-1;">Could not load slots. Please try again.</p>'; }});
+  }}
+
+  dateEl.addEventListener('change', function() {{ if (dateEl.value) loadSlots(dateEl.value); }});
+
+  /* Book Appointment buttons (registration + interaction card) open it */
+  if (apptSec) {{
+    [bookBtn, document.getElementById('schedule-call-btn')].forEach(function (b) {{
+      if (!b) return;
+      b.addEventListener('click', function() {{
+        apptSec.style.display = '';
+        apptSec.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+      }});
+    }});
+  }}
+
+  cBtn.addEventListener('click', function() {{
+    var nm = nameEl ? nameEl.value.trim() : '';
+    var ph = phEl   ? phEl.value.trim()   : '';
+    if (!nm) {{ showSt('Please enter your name.', 'error'); return; }}
+    if (!ph) {{ showSt('Please enter your phone number.', 'error'); return; }}
+    if (!dateEl.value) {{ showSt('Please select a date.', 'error'); return; }}
+    if (!_selTime)     {{ showSt('Please select a time slot.', 'error'); return; }}
+
+    var iso   = dateEl.value + 'T' + _selTime + ':00';
+    var srId  = window._surveyResponseId || null;
+    cBtn.disabled = true;
+    cBtn.textContent = 'Booking…';
+    showSt('Reserving your slot…', 'info');
+
+    fetch(API+'/api/advertisements/'+AD_ID+'/appointments', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{patient_name:nm, patient_phone:ph, slot_datetime:iso, survey_response_id:srId}})
+    }}).then(function(r) {{
+      if (r.status === 409) {{ throw new Error('That slot was just taken — please pick another.'); }}
+      if (!r.ok) return r.json().catch(function() {{ return {{}}; }}).then(function(j) {{ throw new Error(j.detail || 'Booking failed'); }});
+      return r.json();
+    }}).then(function() {{
+      var lbl = _selTime;
+      if (_cache[dateEl.value]) {{
+        var match = _cache[dateEl.value].find(function(s) {{ return s.time === _selTime; }});
+        if (match) lbl = match.label;
+      }}
+      hideSt();
+      cBtn.style.display = 'none';
+      if (msgEl) msgEl.textContent = '✅ Confirmed for ' + dateEl.value + ' at ' + lbl;
+      if (doneEl) doneEl.style.display = 'block';
+      delete _cache[dateEl.value];
+    }}).catch(function(e) {{
+      showSt('&#9888; ' + esc(e.message), 'error');
+      cBtn.disabled = false;
+      cBtn.textContent = 'Confirm Appointment →';
+      if (dateEl.value) loadSlots(dateEl.value);
+    }});
+  }});
+}})();
+</script>"""
+
+        # Hide interaction section initially (JS reveals it post-survey)
+        if has_interact:
+            body = body.replace(
+                'id="interaction-reveal"',
+                'id="interaction-reveal" style="display:none"',
+                1,
+            )
+
+        # Inject registration form at the right position:
+        # before the interaction section → before the footer → or appended before </body>
+        _inject_marker = 'id="interaction-reveal"'
+        _footer_marker = "<footer"
+        if _inject_marker in body:
+            _pos = body.index(_inject_marker)
+            _open = body.rfind("<", 0, _pos)
+            body = body[:_open] + reg_form_html + "\n" + body[_open:]
+        elif _footer_marker in body:
+            _pos = body.rfind(_footer_marker)
+            body = body[:_pos] + reg_form_html + "\n" + body[_pos:]
+        else:
+            body = body + "\n" + reg_form_html
+
+        # ── Survey voice row — rich modal with country picker + scheduling ────────
+        # Always injected (not gated on voicebot). Calls /voice-call/request.
+        survey_voice_js = f"""
+<style>
+/* ── CTA Agent Modal ───────────────────────────────────────────────────────── */
+#cta-overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10000;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);}}
+#cta-overlay.cta-open{{display:flex;animation:ctaFdIn .2s ease;}}
+@keyframes ctaFdIn{{from{{opacity:0}}to{{opacity:1}}}}
+#cta-box{{background:#fff;border-radius:22px;max-width:460px;width:100%;max-height:92vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.28);animation:ctaUp .3s cubic-bezier(.34,1.56,.64,1);}}
+@keyframes ctaUp{{from{{transform:translateY(44px);opacity:0}}to{{transform:translateY(0);opacity:1}}}}
+.cta-hdr{{display:flex;align-items:center;justify-content:space-between;padding:22px 24px 0;flex-shrink:0;}}
+.cta-hdr-title{{font-size:.97rem;font-weight:800;color:#111;}}
+.cta-x{{background:none;border:none;cursor:pointer;width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:18px;line-height:1;transition:background .15s,color .15s;}}
+.cta-x:hover{{background:#f1f5f9;color:#374151;}}
+.cta-phase{{display:none;padding:20px 24px 26px;overflow-y:auto;}}
+.cta-phase.cta-active{{display:block;animation:ctaPhIn .22s ease;}}
+@keyframes ctaPhIn{{from{{opacity:0;transform:translateX(18px)}}to{{opacity:1;transform:translateX(0)}}}}
+/* Country dropdown */
+.cta-dd{{position:relative;margin-bottom:12px;}}
+.cta-dd-btn{{display:flex;align-items:center;gap:8px;width:100%;border:1.5px solid #e2e8f0;border-radius:10px;padding:10px 12px;cursor:pointer;background:#fff;font-size:.9rem;font-family:inherit;box-sizing:border-box;transition:border-color .15s;text-align:left;}}
+.cta-dd-btn:hover,.cta-dd-btn:focus{{border-color:var(--primary);outline:none;}}
+.cta-chevron{{margin-left:auto;color:#94a3b8;font-size:10px;transition:transform .2s;flex-shrink:0;}}
+.cta-dd-btn.open .cta-chevron{{transform:rotate(180deg);}}
+.cta-dd-panel{{display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:#fff;border:1.5px solid #e2e8f0;border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.13);z-index:60;overflow:hidden;}}
+.cta-dd-panel.open{{display:block;animation:ctaDd .15s ease;}}
+@keyframes ctaDd{{from{{opacity:0;transform:translateY(-5px)}}to{{opacity:1;transform:translateY(0)}}}}
+.cta-dd-search{{width:100%;border:none;border-bottom:1px solid #f1f5f9;padding:10px 12px;font-size:.85rem;font-family:inherit;outline:none;box-sizing:border-box;background:#fafafa;}}
+.cta-dd-list{{max-height:210px;overflow-y:auto;}}
+.cta-dd-item{{display:flex;align-items:center;gap:10px;padding:9px 12px;cursor:pointer;font-size:.84rem;transition:background .1s;}}
+.cta-dd-item:hover{{background:#f8fafc;}}
+.cta-dd-item.cta-sel{{background:#f0fdf4;font-weight:600;}}
+.cta-dd-dial{{margin-left:auto;font-size:.75rem;color:#94a3b8;flex-shrink:0;}}
+/* Phone row */
+.cta-phone-row{{display:flex;gap:8px;margin-bottom:6px;}}
+.cta-dial{{display:flex;align-items:center;justify-content:center;gap:4px;padding:10px 10px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:.87rem;font-weight:700;color:#374151;white-space:nowrap;background:#f8fafc;}}
+.cta-phone-inp{{flex:1;border:1.5px solid #e2e8f0;border-radius:10px;padding:10px 12px;font-size:.9rem;font-family:inherit;outline:none;transition:border-color .15s;box-sizing:border-box;min-width:0;}}
+.cta-phone-inp:focus{{border-color:var(--primary);}}
+.cta-phone-inp.cta-err{{border-color:#ef4444;}}
+/* Status bar */
+.cta-status{{display:none;padding:10px 13px;border-radius:10px;font-size:.82rem;font-weight:600;line-height:1.45;margin-top:10px;}}
+.cta-info{{background:#eff6ff;color:#1d4ed8;border:1.5px solid #bfdbfe;}}
+.cta-ok{{background:#f0fdf4;color:#15803d;border:1.5px solid #bbf7d0;}}
+.cta-err-bar{{background:#fef2f2;color:#b91c1c;border:1.5px solid #fecaca;}}
+/* Action buttons */
+.cta-btn-primary{{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;background:var(--accent);color:#fff;border:none;border-radius:12px;padding:13px;font-size:.95rem;font-weight:700;cursor:pointer;font-family:inherit;transition:filter .2s,transform .1s;margin-bottom:10px;}}
+.cta-btn-primary:hover{{filter:brightness(1.07);transform:translateY(-1px);}}
+.cta-btn-primary:active{{transform:translateY(0);}}
+.cta-btn-primary:disabled{{opacity:.6;cursor:not-allowed;transform:none;filter:none;}}
+.cta-btn-outline{{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;background:#fff;color:var(--primary);border:1.5px solid var(--primary);border-radius:12px;padding:12px;font-size:.9rem;font-weight:600;cursor:pointer;font-family:inherit;transition:background .2s,color .2s;}}
+.cta-btn-outline:hover{{background:var(--primary);color:#fff;}}
+.cta-btn-outline:disabled{{opacity:.6;cursor:not-allowed;}}
+/* Divider */
+.cta-div{{display:flex;align-items:center;gap:10px;margin:12px 0;color:#94a3b8;font-size:.75rem;}}
+.cta-div::before,.cta-div::after{{content:'';flex:1;height:1px;background:#e2e8f0;}}
+/* Label */
+.cta-lbl{{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#64748b;display:block;margin-bottom:6px;}}
+/* Date input */
+/* Time slots */
+/* Success ring */
+.cta-ring{{width:70px;height:70px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:32px;}}
+.cta-ring-green{{background:linear-gradient(135deg,#10b981,#059669);}}
+.cta-ring-blue{{background:linear-gradient(135deg,#3b82f6,#1d4ed8);}}
+/* Spinner */
+.cta-spin{{display:inline-block;width:15px;height:15px;border:2.5px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:ctaSp .7s linear infinite;}}
+@keyframes ctaSp{{to{{transform:rotate(360deg)}}}}
+/* Mobile */
+@media(max-width:500px){{
+  #cta-overlay{{align-items:flex-end;padding:0;}}
+  #cta-box{{max-height:94vh;border-radius:20px 20px 0 0;}}
+}}
+</style>
+<script>
+/* ── CTA Agent Modal — country picker + call now + schedule ─────────────── */
+(function () {{
+
+  var AD_ID    = '{ad_id}';
+  var API_BASE = '{settings.backend_base}';
+
+  /* ── Country list ──────────────────────────────────────────────────────── */
+  var CTRY = [
+    {{d:'+1',  f:'\ud83c\uddfa\ud83c\uddf8',n:'United States'}},
+    {{d:'+44', f:'\ud83c\uddec\ud83c\udde7',n:'United Kingdom'}},
+    {{d:'+1',  f:'\ud83c\udde8\ud83c\udde6',n:'Canada'}},
+    {{d:'+61', f:'\ud83c\udde6\ud83c\uddfa',n:'Australia'}},
+    {{d:'+91', f:'\ud83c\uddee\ud83c\uddf3',n:'India'}},
+    {{d:'+49', f:'\ud83c\udde9\ud83c\uddea',n:'Germany'}},
+    {{d:'+33', f:'\ud83c\uddeb\ud83c\uddf7',n:'France'}},
+    {{d:'+34', f:'\ud83c\uddea\ud83c\uddf8',n:'Spain'}},
+    {{d:'+39', f:'\ud83c\uddee\ud83c\uddf9',n:'Italy'}},
+    {{d:'+55', f:'\ud83c\udde7\ud83c\uddf7',n:'Brazil'}},
+    {{d:'+52', f:'\ud83c\uddf2\ud83c\uddfd',n:'Mexico'}},
+    {{d:'+81', f:'\ud83c\uddef\ud83c\uddf5',n:'Japan'}},
+    {{d:'+82', f:'\ud83c\uddf0\ud83c\uddf7',n:'South Korea'}},
+    {{d:'+86', f:'\ud83c\udde8\ud83c\uddf3',n:'China'}},
+    {{d:'+31', f:'\ud83c\uddf3\ud83c\uddf1',n:'Netherlands'}},
+    {{d:'+46', f:'\ud83c\uddf8\ud83c\uddea',n:'Sweden'}},
+    {{d:'+47', f:'\ud83c\uddf3\ud83c\uddf4',n:'Norway'}},
+    {{d:'+45', f:'\ud83c\udde9\ud83c\uddf0',n:'Denmark'}},
+    {{d:'+358',f:'\ud83c\uddeb\ud83c\uddee',n:'Finland'}},
+    {{d:'+41', f:'\ud83c\udde8\ud83c\udded',n:'Switzerland'}},
+    {{d:'+43', f:'\ud83c\udde6\ud83c\uddf9',n:'Austria'}},
+    {{d:'+32', f:'\ud83c\udde7\ud83c\uddea',n:'Belgium'}},
+    {{d:'+48', f:'\ud83c\uddf5\ud83c\uddf1',n:'Poland'}},
+    {{d:'+351',f:'\ud83c\uddf5\ud83c\uddf9',n:'Portugal'}},
+    {{d:'+30', f:'\ud83c\uddec\ud83c\uddf7',n:'Greece'}},
+    {{d:'+90', f:'\ud83c\uddf9\ud83c\uddf7',n:'Turkey'}},
+    {{d:'+966',f:'\ud83c\uddf8\ud83c\udde6',n:'Saudi Arabia'}},
+    {{d:'+971',f:'\ud83c\udde6\ud83c\uddea',n:'UAE'}},
+    {{d:'+65', f:'\ud83c\uddf8\ud83c\uddec',n:'Singapore'}},
+    {{d:'+60', f:'\ud83c\uddf2\ud83c\uddfe',n:'Malaysia'}},
+    {{d:'+63', f:'\ud83c\uddf5\ud83c\udded',n:'Philippines'}},
+    {{d:'+62', f:'\ud83c\uddee\ud83c\udde9',n:'Indonesia'}},
+    {{d:'+66', f:'\ud83c\uddf9\ud83c\udded',n:'Thailand'}},
+    {{d:'+84', f:'\ud83c\uddfb\ud83c\uddf3',n:'Vietnam'}},
+    {{d:'+64', f:'\ud83c\uddf3\ud83c\uddff',n:'New Zealand'}},
+    {{d:'+54', f:'\ud83c\udde6\ud83c\uddf7',n:'Argentina'}},
+    {{d:'+57', f:'\ud83c\udde8\ud83c\uddf4',n:'Colombia'}},
+    {{d:'+92', f:'\ud83c\uddf5\ud83c\uddf0',n:'Pakistan'}},
+    {{d:'+20', f:'\ud83c\uddea\ud83c\uddec',n:'Egypt'}},
+    {{d:'+27', f:'\ud83c\uddff\ud83c\udde6',n:'South Africa'}},
+    {{d:'+234',f:'\ud83c\uddf3\ud83c\uddec',n:'Nigeria'}},
+    {{d:'+254',f:'\ud83c\uddf0\ud83c\uddea',n:'Kenya'}},
+    {{d:'+353',f:'\ud83c\uddee\ud83c\uddea',n:'Ireland'}},
+    {{d:'+852',f:'\ud83c\udded\ud83c\uddf0',n:'Hong Kong'}},
+    {{d:'+972',f:'\ud83c\uddee\ud83c\uddf1',n:'Israel'}},
+    {{d:'+7',  f:'\ud83c\uddf7\ud83c\uddfa',n:'Russia'}},
+    {{d:'+420',f:'\ud83c\udde8\ud83c\uddff',n:'Czech Republic'}},
+    {{d:'+36', f:'\ud83c\udded\ud83c\uddfa',n:'Hungary'}},
+    {{d:'+40', f:'\ud83c\uddf7\ud83c\uddf4',n:'Romania'}},
+    {{d:'+380',f:'\ud83c\uddfa\ud83c\udde6',n:'Ukraine'}},
+  ];
+
+  /* ── State ──────────────────────────────────────────────────────────────── */
+  var ctry    = CTRY[0];
+  var ddOpen  = false;
+
+  /* ── Build modal HTML ───────────────────────────────────────────────────── */
+  var _w = document.createElement('div');
+  _w.innerHTML = (
+    '<div id="cta-overlay" role="dialog" aria-modal="true" aria-label="Connect to an Agent">' +
+      '<div id="cta-box">' +
+        '<div class="cta-hdr">' +
+          '<div style="display:flex;align-items:center;gap:9px">' +
+            '<span style="font-size:1.4rem">&#128222;</span>' +
+            '<span class="cta-hdr-title">Connect to an Agent</span>' +
+          '</div>' +
+          '<button class="cta-x" id="cta-x" aria-label="Close">&#10005;</button>' +
+        '</div>' +
+        /* ── Phase 1: phone ── */
+        '<div class="cta-phase cta-active" id="cta-ph1">' +
+          '<p style="font-size:.83rem;color:#64748b;margin:0 0 18px;line-height:1.55">Enter your number and choose how you\\'d like us to connect.</p>' +
+          '<span class="cta-lbl">Country</span>' +
+          '<div class="cta-dd">' +
+            '<button class="cta-dd-btn" id="cta-ddb" type="button" aria-haspopup="listbox" aria-expanded="false">' +
+              '<span id="cta-df" style="font-size:1.15rem"></span>' +
+              '<span id="cta-dn" style="flex:1;text-align:left"></span>' +
+              '<span class="cta-chevron">&#9660;</span>' +
+            '</button>' +
+            '<div class="cta-dd-panel" id="cta-ddp" role="listbox">' +
+              '<input class="cta-dd-search" id="cta-dds" type="text" placeholder="\ud83d\udd0d Search country\u2026" aria-label="Search country" />' +
+              '<div class="cta-dd-list" id="cta-ddl"></div>' +
+            '</div>' +
+          '</div>' +
+          '<span class="cta-lbl">Phone Number</span>' +
+          '<div class="cta-phone-row">' +
+            '<div class="cta-dial" id="cta-badge"></div>' +
+            '<input class="cta-phone-inp" id="cta-phone" type="tel" placeholder="555 000 0000" autocomplete="tel-national" aria-label="Phone number" />' +
+          '</div>' +
+          '<div class="cta-status" id="cta-s1"></div>' +
+          '<div style="height:16px"></div>' +
+          '<button class="cta-btn-primary" id="cta-now">&#128222;&ensp;Get a Call Now</button>' +
+          '<div class="cta-div">or</div>' +
+          '<button class="cta-btn-outline" id="cta-sched">&#128197;&ensp;Book an Appointment</button>' +
+        '</div>' +
+        /* ── Phase 3: success call ── */
+        '<div class="cta-phase" id="cta-ph3" style="text-align:center;padding:38px 24px">' +
+          '<div class="cta-ring cta-ring-green">&#9989;</div>' +
+          '<p style="font-size:1.08rem;font-weight:800;color:#111;margin:0 0 8px">Calling you now!</p>' +
+          '<p style="font-size:.85rem;color:#64748b;line-height:1.6;margin:0 0 6px">Your phone will ring in a few seconds. Pick up to speak with our agent.</p>' +
+          '<p id="cta-ph3-hint" style="font-size:.75rem;color:#94a3b8;line-height:1.5;margin:0 0 22px;display:none">Didn’t get a call? The number you entered was <strong id="cta-ph3-num"></strong>. Check it’s correct and try again.</p>' +
+          '<button class="cta-btn-outline" id="cta-ok1" style="max-width:180px;margin:0 auto">Done</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>'
+  );
+  document.body.appendChild(_w);
+
+  /* ── DOM refs ────────────────────────────────────────────────────────────── */
+  var overlay  = document.getElementById('cta-overlay');
+  var xBtn     = document.getElementById('cta-x');
+  var ddb      = document.getElementById('cta-ddb');
+  var ddp      = document.getElementById('cta-ddp');
+  var dds      = document.getElementById('cta-dds');
+  var ddl      = document.getElementById('cta-ddl');
+  var dfEl     = document.getElementById('cta-df');
+  var dnEl     = document.getElementById('cta-dn');
+  var badge    = document.getElementById('cta-badge');
+  var phoneInp = document.getElementById('cta-phone');
+  var s1       = document.getElementById('cta-s1');
+  var nowBtn   = document.getElementById('cta-now');
+  var schedBtn = document.getElementById('cta-sched');
+  var ph3Hint  = document.getElementById('cta-ph3-hint');
+  var ph3Num   = document.getElementById('cta-ph3-num');
+  var _callHintTimer = null;
+
+  /* ── Phase helpers ──────────────────────────────────────────────────────── */
+  var PH = ['cta-ph1','cta-ph3'];
+  function showPh(id) {{
+    PH.forEach(function(p) {{ document.getElementById(p).classList.remove('cta-active'); }});
+    document.getElementById(id).classList.add('cta-active');
+  }}
+
+  /* ── Open / close ───────────────────────────────────────────────────────── */
+  function openModal() {{
+    overlay.classList.add('cta-open');
+    document.body.style.overflow = 'hidden';
+    showPh('cta-ph1');
+    reset1();
+    setTimeout(function() {{ phoneInp.focus(); }}, 340);
+  }}
+  function closeModal() {{
+    overlay.classList.remove('cta-open');
+    document.body.style.overflow = '';
+    closeDd();
+    if (_callHintTimer) {{ clearTimeout(_callHintTimer); _callHintTimer = null; }}
+  }}
+  xBtn.addEventListener('click', closeModal);
+  ok1.addEventListener('click', closeModal);
+  overlay.addEventListener('click', function(e) {{ if (e.target === overlay) closeModal(); }});
+  document.addEventListener('keydown', function(e) {{ if (e.key === 'Escape' && overlay.classList.contains('cta-open')) closeModal(); }});
+
+  /* ── Country dropdown ───────────────────────────────────────────────────── */
+  function renderDd(q) {{
+    q = (q || '').toLowerCase();
+    ddl.innerHTML = '';
+    CTRY.forEach(function(c) {{
+      if (q && c.n.toLowerCase().indexOf(q) === -1 && c.d.indexOf(q) === -1) return;
+      var it = document.createElement('div');
+      it.className = 'cta-dd-item' + (c === ctry ? ' cta-sel' : '');
+      it.setAttribute('role','option');
+      it.setAttribute('aria-selected', String(c === ctry));
+      it.innerHTML = '<span style="font-size:1.15rem;line-height:1">' + c.f + '</span>' +
+                     '<span>' + c.n + '</span>' +
+                     '<span class="cta-dd-dial">' + c.d + '</span>';
+      it.addEventListener('click', function() {{ selectCtry(c); }});
+      ddl.appendChild(it);
+    }});
+    if (!ddl.children.length) ddl.innerHTML = '<div style="padding:10px 12px;font-size:.82rem;color:#94a3b8">No results</div>';
+  }}
+  function selectCtry(c) {{
+    ctry = c;
+    dfEl.textContent  = c.f;
+    dnEl.textContent  = c.n;
+    badge.textContent = c.f + '\u00a0' + c.d;
+    closeDd();
+    renderDd('');
+  }}
+  function openDd() {{
+    ddOpen = true;
+    ddp.classList.add('open');
+    ddb.classList.add('open');
+    ddb.setAttribute('aria-expanded','true');
+    dds.value = '';
+    renderDd('');
+    setTimeout(function() {{ dds.focus(); }}, 40);
+  }}
+  function closeDd() {{
+    ddOpen = false;
+    ddp.classList.remove('open');
+    ddb.classList.remove('open');
+    ddb.setAttribute('aria-expanded','false');
+  }}
+  ddb.addEventListener('click', function(e) {{ e.stopPropagation(); ddOpen ? closeDd() : openDd(); }});
+  dds.addEventListener('input', function() {{ renderDd(dds.value); }});
+  document.addEventListener('click', function(e) {{
+    if (ddOpen && !ddp.contains(e.target) && e.target !== ddb) closeDd();
+  }});
+  selectCtry(CTRY[0]);  /* init */
+
+  /* ── Phone helpers ──────────────────────────────────────────────────────── */
+  function digits() {{ return (phoneInp.value || '').replace(/\\D/g,''); }}
+  function fullNum() {{ return ctry.d + digits(); }}
+  function validPhone() {{
+    if (digits().length < 5) {{ phoneInp.classList.add('cta-err'); return false; }}
+    phoneInp.classList.remove('cta-err');
+    return true;
+  }}
+  phoneInp.addEventListener('input', function() {{ phoneInp.classList.remove('cta-err'); hideSt(s1); }});
+  phoneInp.addEventListener('keydown', function(e) {{ if (e.key === 'Enter') {{ e.preventDefault(); nowBtn.click(); }} }});
+
+  /* ── Status helpers ─────────────────────────────────────────────────────── */
+  function esc(s) {{ return String(s).replace(/[&<>"']/g, function(c) {{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]; }}); }}
+  function showSt(el, msg, t) {{
+    el.className = 'cta-status ' + (t === 'error' ? 'cta-err-bar' : t === 'ok' ? 'cta-ok' : 'cta-info');
+    el.innerHTML = msg;
+    el.style.display = 'block';
+  }}
+  function hideSt(el) {{ el.style.display = 'none'; }}
+
+  /* ── API ────────────────────────────────────────────────────────────────── */
+  function apiCall(phone) {{
+    var payload = {{phone_number: phone}};
+    return fetch(API_BASE + '/api/advertisements/' + AD_ID + '/voice-call/request', {{
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify(payload)
+    }}).then(function(r) {{
+      if (!r.ok) return r.json().catch(function(){{return{{}}}}).then(function(j){{
+        throw new Error(j.detail || 'Request failed (HTTP ' + r.status + ')');
+      }});
+      return r.json();
+    }});
+  }}
+
+  /* ── Reset phase 1 ──────────────────────────────────────────────────────── */
+  function reset1() {{
+    hideSt(s1);
+    nowBtn.disabled = false;
+    nowBtn.innerHTML = '&#128222;&ensp;Get a Call Now';
+    schedBtn.disabled = false;
+    phoneInp.classList.remove('cta-err');
+  }}
+
+  /* ── Call Now ───────────────────────────────────────────────────────────── */
+  nowBtn.addEventListener('click', function() {{
+    if (!validPhone()) {{ showSt(s1,'Please enter a valid phone number.','error'); phoneInp.focus(); return; }}
+    var dialledNumber = fullNum();
+    nowBtn.disabled = true;
+    nowBtn.innerHTML = '<span class="cta-spin"></span>&ensp;Connecting\u2026';
+    schedBtn.disabled = true;
+    showSt(s1,'Reaching our agent \u2014 your phone will ring shortly\u2026','info');
+    apiCall(dialledNumber).then(function() {{
+      if (ph3Hint) ph3Hint.style.display = 'none';
+      if (ph3Num)  ph3Num.textContent = dialledNumber;
+      showPh('cta-ph3');
+      if (_callHintTimer) clearTimeout(_callHintTimer);
+      _callHintTimer = setTimeout(function() {{
+        if (ph3Hint) ph3Hint.style.display = 'block';
+      }}, 30000);
+    }}).catch(function(e) {{
+      showSt(s1,'&#9888; ' + esc(e.message),'error');
+      reset1();
+    }});
+  }});
+
+  /* ── Book an appointment ──────────────────────────────────────── */
+  schedBtn.addEventListener('click', function() {{
+    closeModal();
+    var appt = document.getElementById('appt-section');
+    if (appt) {{
+      appt.style.display = '';
+      appt.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+    }}
+  }});
+
+  /* ── Open on button click ───────────────────────────────────────────────── */
+  document.addEventListener('click', function(e) {{
+    var btn = e.target.closest('#survey-voice-btn, .btn-voice-call, #voice-call-btn');
+    if (btn) openModal();
+  }});
+
+}})();
+</script>"""
+
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Landing Page</title>
-  <style>{css}</style>
+  <title>{title}</title>
+  <style>{css}
+  </style>
 </head>
 <body>
 {body}
+{chat_float_html}
+{survey_js}
+{chat_js}
+{survey_voice_js}
 </body>
 </html>"""
 
