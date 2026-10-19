@@ -51,9 +51,25 @@ def _allowed_origins() -> list[str]:
     return [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
 
 
+def _is_public_write(request: Request) -> bool:
+    path = request.url.path or ""
+    if request.method != "POST":
+        return False
+    return (
+        path == "/api/chat"
+        or path.endswith("/voice-call/request")
+        or path.endswith("/appointments")
+        or path.endswith("/survey-responses")
+    )
+
+
 async def _csrf_origin_check(request: Request, call_next):
     # ponytail: SameSite=Lax does the heavy lifting; this only closes forged-Origin gaps, no token store
-    if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.cookies.get("access_token"):
+    if (
+        request.method in ("POST", "PUT", "PATCH", "DELETE")
+        and request.cookies.get("access_token")
+        and not _is_public_write(request)
+    ):
         origin = request.headers.get("origin") or request.headers.get("referer")
         if origin:
             from urllib.parse import urlparse
